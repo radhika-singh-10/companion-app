@@ -6,6 +6,26 @@ import { Tooltip } from "react-tooltip";
 
 import { getCompanions } from "./actions";
 
+// Approved model registry: only these pinned model identifiers are permitted.
+const APPROVED_MODEL_REGISTRY: Record<string, string> = {
+  "gpt-4-0613": "gpt-4-0613",
+  "gpt-3.5-turbo-0125": "gpt-3.5-turbo-0125",
+  "claude-3-opus-20240229": "claude-3-opus-20240229",
+  "claude-3-sonnet-20240229": "claude-3-sonnet-20240229",
+  "gemini-1.0-pro-001": "gemini-1.0-pro-001",
+};
+
+const FALLBACK_MODEL = "unverified-model";
+
+function resolveApprovedModel(llm: string): string {
+  const trimmed = (llm ?? "").trim();
+  if (Object.prototype.hasOwnProperty.call(APPROVED_MODEL_REGISTRY, trimmed)) {
+    return APPROVED_MODEL_REGISTRY[trimmed];
+  }
+  console.warn(`[Model Registry] Rejected unregistered model identifier: "${trimmed}"`);
+  return FALLBACK_MODEL;
+}
+
 export default function Examples() {
   const [QAModalOpen, setQAModalOpen] = useState(false);
   const [CompParam, setCompParam] = useState({
@@ -13,13 +33,13 @@ export default function Examples() {
     title: "",
     imageUrl: "",
   });
+  const APPROVED_LLMS = ["Claude", "Gemini", "Llama", "Mistral"];
+
   const [examples, setExamples] = useState([
     {
       name: "",
       title: "",
       imageUrl: "",
-      llm: "",
-      phone: "",
       telegramLink: null
     },
   ]);
@@ -29,12 +49,10 @@ export default function Examples() {
       try {
         const companions = await getCompanions();
         let entries = JSON.parse(companions);
-        let setme = entries.map((entry: any) => ({
+                let setme = entries.map((entry: any) => ({
           name: entry.name,
           title: entry.title,
           imageUrl: entry.imageUrl,
-          llm: entry.llm,
-          phone: entry.phone,
           telegramLink: entry.telegramLink
         }));
         setExamples(setme);
@@ -65,6 +83,10 @@ export default function Examples() {
               setQAModalOpen(true);
             }}
             className="col-span-2 flex flex-col rounded-lg bg-slate-800  text-center shadow relative ring-1 ring-white/10 cursor-pointer hover:ring-sky-300/70 transition"
+            data-ai-generated="true"
+            data-content-origin="ai-companion"
+            data-llm={example.llm}
+            data-provenance-timestamp={new Date().toISOString()}
           >
             <div className="absolute -bottom-px left-10 right-10 h-px bg-gradient-to-r from-sky-300/0 via-sky-300/70 to-sky-300/0"></div>
             <div className="flex flex-1 flex-col p-8">
@@ -73,18 +95,27 @@ export default function Examples() {
                 height={0}
                 sizes="100vw"
                 className="mx-auto h-32 w-32 flex-shrink-0 rounded-full"
-                src={example.imageUrl}
+                src={sanitizeImageUrl(example.imageUrl)}
                 alt=""
               />
-              <h3 className="mt-6 text-sm font-medium text-white">
+              <div className="mt-4 flex justify-center">
+                <span
+                  aria-label="AI-Generated Content"
+                  title="This companion is AI-generated synthetic content"
+                  className="inline-flex items-center rounded-full bg-sky-900/60 px-2 py-0.5 text-xs font-medium text-sky-300 ring-1 ring-sky-300/40"
+                >
+                  🤖 AI-Generated
+                </span>
+              </div>
+              <h3 className="mt-2 text-sm font-medium text-white">
                 {example.name}
               </h3>
               <dl className="mt-1 flex flex-grow flex-col justify-between">
                 <dt className="sr-only"></dt>
-                <dd className="text-sm text-slate-400">
-                  {example.title}. Running on <b>{example.llm}</b>.
-                  {example.telegramLink && (
-                    <span className="ml-1"><a onClick={(event) => {event?.stopPropagation(); event?.preventDefault}} href={example.telegramLink}>Chat on <b>Telegram</b></a>.</span>
+                <dd className="text-sm text-slate-400" data-ai-generated="true" data-llm={example.llm} data-content-origin="ai-companion">
+                  {example.title}.
+                  {example.telegramLink && isSafeTelegramUrl(example.telegramLink) && (
+                    <span className="ml-1"><a onClick={(event) => {event?.stopPropagation(); event?.preventDefault()}} href={example.telegramLink} rel="noopener noreferrer" target="_blank">Chat on <b>Telegram</b></a>.</span>
                   )}
                 </dd>
               </dl>
@@ -96,7 +127,7 @@ export default function Examples() {
                       data-tip="Helpful tip goes here"
                       className="text-sm text-slate-400 inline-block"
                     >
-                      📱Text me at: <b>{example.phone}</b>
+                      📱Text me at: <b>{maskPhoneNumber(example.phone)}</b>
                       &nbsp;
                       <svg
                         data-tooltip-id="help-tooltip"
@@ -128,4 +159,56 @@ export default function Examples() {
 function isPhoneNumber(input: string): boolean {
   const phoneNumberRegex = /^\+\d{1,11}$/;
   return phoneNumberRegex.test(input);
+}
+
+/**
+ * Validates a Telegram link URL.
+ * Only allows https: scheme URLs pointing to t.me to prevent
+ * open redirect and javascript: URI injection attacks.
+ */
+function sanitizeTelegramLink(url: string | undefined | null): string | null {
+  if (!url) return null;
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== 'https:') return null;
+    if (parsed.hostname !== 't.me' && !parsed.hostname.endsWith('.t.me')) return null;
+    return parsed.toString();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Validates an image source URL.
+ * Only allows https: scheme URLs to prevent SSRF-adjacent risks
+ * and information leakage via referrer headers.
+ */
+function sanitizeImageUrl(url: string | undefined | null): string {
+  if (!url) return '';
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== 'https:') return '';
+    return parsed.toString();
+  } catch {
+    return '';
+  }
+}
+
+function isSafeTelegramUrl(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    return parsed.protocol === 'https:' && parsed.hostname === 't.me';
+  } catch {
+    return false;
+  }
+}
+
+function maskPhoneNumber(phone: string): string {
+  if (!phone || phone.length < 4) return '***';
+  // Keep the '+' and country code (up to 3 chars after '+'), mask the middle, show last 2 digits
+  const visiblePrefix = phone.startsWith('+') ? phone.slice(0, Math.min(3, phone.length - 2)) : phone.slice(0, 1);
+  const visibleSuffix = phone.slice(-2);
+  const maskedLength = phone.length - visiblePrefix.length - visibleSuffix.length;
+  const masked = '*'.repeat(Math.max(maskedLength, 3));
+  return `${visiblePrefix}${masked}${visibleSuffix}`;
 }

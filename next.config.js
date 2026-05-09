@@ -13,18 +13,6 @@ const nextConfig = {
       },
       {
         protocol: "https",
-        hostname: "tjzk.replicate.delivery",
-        port: "",
-        pathname: "**",
-      },
-      {
-        protocol: "https",
-        hostname: "replicate.delivery",
-        port: "",
-        pathname: "**",
-      },
-      {
-        protocol: "https",
         hostname: "a16z.com",
         port: "",
         pathname: "**",

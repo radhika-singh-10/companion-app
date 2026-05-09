@@ -1,5 +1,5 @@
 -- Reference: https://js.langchain.com/docs/modules/indexes/vector_stores/integrations/supabase#create-a-table-and-search-function-in-your-database
--- Visit Supabase blogpost for more: https://supabase.com/blog/openai-embeddings-postgres-vector
+-- Visit Supabase docs for more: https://supabase.com/docs/guides/ai/vector-columns
 -- Enable the pgvector extension to work with embedding vectors
 create extension vector;
 
@@ -8,18 +8,18 @@ create table documents (
   id bigserial primary key,
   content text, -- corresponds to Document.pageContent
   metadata jsonb, -- corresponds to Document.metadata
-  embedding vector(1536) -- 1536 works for OpenAI embeddings, change if needed
+  embedding vector(768) -- 768 dimensions for approved embedding models (e.g., sentence-transformers/all-mpnet-base-v2)
 );
 
 -- Create a function to search for documents
 create function match_documents (
-  query_embedding vector(1536),
+  query_embedding vector(768),
   match_count int DEFAULT null,
   filter jsonb DEFAULT '{}'
 ) returns table (
-  id bigint,
   content text,
-  metadata jsonb,
+  source text,
+  title text,
   similarity float
 )
 language plpgsql
@@ -28,9 +28,9 @@ as $$
 begin
   return query
   select
-    id,
-    content,
-    metadata,
+    left(content, 2000),
+    (metadata->>'source')::text,
+    (metadata->>'title')::text,
     1 - (documents.embedding <=> query_embedding) as similarity
   from documents
   where metadata @> filter
