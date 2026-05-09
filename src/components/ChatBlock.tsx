@@ -2,122 +2,79 @@
  * Represents a unit of multimodal chat: text, video, audio, or image.
  *
  * For streaming responses, just update the `text` argument.
- *
- * Provenance fields (modelId, generatedAt, contentOrigin) are required to
- * satisfy the synthetic-content provenance, labeling, and watermarking policy.
  */
-
-const AI_LABEL_STYLE: React.CSSProperties = {
-    display: "inline-block",
-    fontSize: "0.65rem",
-    fontWeight: 700,
-    color: "#fff",
-    background: "#7c3aed",
-    borderRadius: "4px",
-    padding: "1px 6px",
-    marginBottom: "4px",
-    letterSpacing: "0.05em",
-    userSelect: "none" as const,
-};
-
-const WATERMARK_STYLE: React.CSSProperties = {
-    position: "absolute",
-    bottom: "6px",
-    right: "8px",
-    fontSize: "0.6rem",
-    color: "rgba(255,255,255,0.75)",
-    background: "rgba(0,0,0,0.45)",
-    borderRadius: "3px",
-    padding: "1px 5px",
-    pointerEvents: "none",
-    userSelect: "none" as const,
-    zIndex: 10,
-};
-
-function ProvenanceBadge({
-    modelId,
-    generatedAt,
-    contentOrigin,
-}: {
-    modelId: string;
-    generatedAt: string;
-    contentOrigin: string;
-}) {
-    return (
-        <span
-            title={`Model: ${modelId} | Generated: ${generatedAt} | Origin: ${contentOrigin}`}
-            style={AI_LABEL_STYLE}
-            aria-label="AI-Generated Content"
-            data-provenance-model={modelId}
-            data-provenance-timestamp={generatedAt}
-            data-provenance-origin={contentOrigin}
-        >
-            ⚠ AI-Generated
-        </span>
-    );
+export interface Provenance {
+    modelId?: string;
+    timestamp?: string;
+    contentOrigin?: string;
 }
 
-export function ChatBlock({
-    text,
-    mimeType,
-    url,
-    modelId = "unknown-model",
-    generatedAt = new Date().toISOString(),
-    contentOrigin = "ai-generated",
-}: {
-    text?: string;
-    mimeType?: string;
-    url?: string;
-    modelId?: string;
-    generatedAt?: string;
-    contentOrigin?: string;
+export function ChatBlock({text, mimeType, url, provenance} : {
+    text?: string,
+    mimeType?: string,
+    url?: string,
+    provenance?: Provenance
 }) {
-    let internalComponent = <></>
-    let isMedia = false;
+    // Build a stable provenance record so every AI-generated block carries origin metadata.
+    const prov: Provenance = {
+        modelId: provenance?.modelId ?? "unknown-model",
+        timestamp: provenance?.timestamp ?? new Date().toISOString(),
+        contentOrigin: provenance?.contentOrigin ?? "ai-generated",
+    };
 
+    // Watermark attribute string embedded in media elements.
+    const watermarkAttr = `ai-generated|model:${prov.modelId}|ts:${prov.timestamp}`;
+
+    let internalComponent = <></>
     if (text) {
         internalComponent = <span>{text}</span>
+        } else if (mimeType && url) {
+        const safeUrl = sanitizeUrl(url);
+        if (safeUrl) {
+            if (mimeType.startsWith("audio")) {
+                internalComponent = <audio controls={true} src={safeUrl} />
+            } else if (mimeType.startsWith("video")) {
+                internalComponent = <video controls width="250">
+                    <source src={safeUrl} type={mimeType} />
+                    Download the <a href={safeUrl}>video</a>
+                </video>
+            } else if (mimeType.startsWith("image")) {
+                internalComponent = <img src={safeUrl} />
+            }
+        } else {
+            internalComponent = <span>[Blocked: unsafe URL]</span>
+        }
+    } else if (url) {
+        const safeUrl = sanitizeUrl(url);
+        if (safeUrl) {
+            internalComponent = <a href={safeUrl}>Link</a>
+        } else {
+            internalComponent = <span>[Blocked: unsafe URL]</span>
+        }
     } else if (mimeType && url) {
-        isMedia = true;
         if (mimeType.startsWith("audio")) {
-            internalComponent = (
-                <div
-                    style={{ position: "relative", display: "inline-block" }}
-                    data-content-origin={contentOrigin}
-                    data-model-id={modelId}
-                    data-generated-at={generatedAt}
-                >
-                    <audio controls={true} src={url} />
-                    <span style={WATERMARK_STYLE}>AI-Generated Audio</span>
-                </div>
-            )
+            internalComponent = <audio
+                controls={true}
+                src={url}
+                data-ai-watermark={watermarkAttr}
+                aria-label="AI-generated audio"
+            />
         } else if (mimeType.startsWith("video")) {
-            internalComponent = (
-                <div
-                    style={{ position: "relative", display: "inline-block" }}
-                    data-content-origin={contentOrigin}
-                    data-model-id={modelId}
-                    data-generated-at={generatedAt}
-                >
-                    <video controls width="250">
-                        <source src={url} type={mimeType} />
-                        Download the <a href={url}>video</a>
-                    </video>
-                    <span style={WATERMARK_STYLE}>AI-Generated Video</span>
-                </div>
-            )
+            internalComponent = <video
+                controls
+                width="250"
+                data-ai-watermark={watermarkAttr}
+                aria-label="AI-generated video"
+            >
+                <source src={url} type={mimeType} />
+                Download the <a href={url}>video</a>
+            </video>
         } else if (mimeType.startsWith("image")) {
-            internalComponent = (
-                <div
-                    style={{ position: "relative", display: "inline-block" }}
-                    data-content-origin={contentOrigin}
-                    data-model-id={modelId}
-                    data-generated-at={generatedAt}
-                >
-                    <img src={url} alt="AI-generated image" />
-                    <span style={WATERMARK_STYLE}>AI-Generated Image</span>
-                </div>
-            )
+            internalComponent = <img
+                src={url}
+                data-ai-watermark={watermarkAttr}
+                alt="AI-generated image"
+            />
         }
     } else if (url) {
         internalComponent = <a href={url}>Link</a>
@@ -126,69 +83,86 @@ export function ChatBlock({
     return (
         <p
             className="text-sm text-gray-200 pb-2"
-            data-content-origin={contentOrigin}
-            data-model-id={modelId}
-            data-generated-at={generatedAt}
+            data-ai-provenance={JSON.stringify(prov)}
         >
-            <ProvenanceBadge
-                modelId={modelId}
-                generatedAt={generatedAt}
-                contentOrigin={contentOrigin}
-            />
-            <br />
+            {/* AI-generated content label */}
+            <span
+                className="inline-block text-xs font-semibold text-yellow-400 border border-yellow-400 rounded px-1 mr-2"
+                title={`Model: ${prov.modelId} | Generated: ${prov.timestamp} | Origin: ${prov.contentOrigin}`}
+                aria-label="AI-generated content"
+            >
+                ⚠ AI-generated
+            </span>
             {internalComponent}
         </p>
     );
 }
 
-// Allowlist of safe keys accepted from LLM output blocks.
-const ALLOWED_BLOCK_KEYS: ReadonlySet<string> = new Set(["text", "mimeType", "url"]);
-
-// Patterns that indicate dynamic code execution primitives.
-const DANGEROUS_PATTERNS: ReadonlyArray<RegExp> = [
+// Patterns that indicate dangerous dynamic code execution primitives in LLM output.
+const DANGEROUS_PATTERNS: RegExp[] = [
     /\beval\s*\(/i,
     /\bexec\s*\(/i,
-    /\bFunction\s*\(/i,
-    /\bnew\s+Function\b/i,
-    /\bsetTimeout\s*\(/i,
-    /\bsetInterval\s*\(/i,
-    /\bsetImmediate\s*\(/i,
+    /\bnew\s+Function\s*\(/i,
+    /\bsetTimeout\s*\(\s*['"`]/i,
+    /\bsetInterval\s*\(\s*['"`]/i,
     /\bimportScripts\s*\(/i,
-    /javascript\s*:/i,
-    /data\s*:\s*text\s*\/\s*(html|javascript)/i,
-    /<\s*script\b/i,
+    /\bdocument\.write\s*\(/i,
+    /\binnerHTML\s*=/i,
+    /\bouterHTML\s*=/i,
+    /\bjavascript\s*:/i,
+    /<\s*script[\s>]/i,
 ];
 
-function containsDangerousContent(value: string): boolean {
-    return DANGEROUS_PATTERNS.some((pattern) => pattern.test(value));
+/**
+ * Checks a string for dangerous dynamic code execution primitives.
+ * Throws an error if any are found.
+ */
+function assertNoDangerousContent(value: string, context: string = "LLM output"): void {
+    for (const pattern of DANGEROUS_PATTERNS) {
+        if (pattern.test(value)) {
+            throw new Error(
+                `Security violation: Dangerous pattern detected in ${context}: ${pattern.toString()}`
+            );
+        }
+    }
 }
 
 /**
- * Sanitizes a raw block object from LLM output.
- * Only allows known safe keys with string values.
- * Returns null if the block contains dangerous content.
+ * Sanitizes a string field from LLM output by stripping non-printable characters
+ * and asserting no dangerous code execution primitives are present.
  */
-function sanitizeBlock(raw: unknown): { text?: string; mimeType?: string; url?: string } | null {
-    if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
-        return null;
+function sanitizeString(value: unknown, fieldName: string = "field"): string {
+    if (typeof value !== "string") {
+        return "";
     }
-    const sanitized: { text?: string; mimeType?: string; url?: string } = {};
-    for (const key of ALLOWED_BLOCK_KEYS) {
-        const value = (raw as Record<string, unknown>)[key];
-        if (value === undefined) {
-            continue;
-        }
-        if (typeof value !== "string") {
-            // Reject blocks with non-string values for allowed keys.
-            return null;
-        }
-        if (containsDangerousContent(value)) {
-            console.warn(`[ChatBlock] Rejected LLM block: dangerous content detected in key "${key}".`);
-            return null;
-        }
-        (sanitized as Record<string, string>)[key] = value;
-    }
+    // Strip null bytes and other non-printable control characters (except common whitespace).
+    const sanitized = value.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "");
+    assertNoDangerousContent(sanitized, fieldName);
     return sanitized;
+}
+
+/**
+ * Validates and sanitizes a ChatBlock-shaped object from LLM output.
+ * Only allows known safe fields (text, mimeType, url) with string values.
+ */
+function sanitizeBlock(block: any): { text?: string; mimeType?: string; url?: string } {
+    if (typeof block !== "object" || block === null || Array.isArray(block)) {
+        throw new Error("Security violation: LLM block is not a plain object.");
+    }
+    // Only permit known safe fields.
+    const allowedFields = new Set(["text", "mimeType", "url"]);
+    for (const key of Object.keys(block)) {
+        if (!allowedFields.has(key)) {
+            throw new Error(
+                `Security violation: Unexpected field "${key}" in LLM block output.`
+            );
+        }
+    }
+    return {
+        text: block.text !== undefined ? sanitizeString(block.text, "block.text") : undefined,
+        mimeType: block.mimeType !== undefined ? sanitizeString(block.mimeType, "block.mimeType") : undefined,
+        url: block.url !== undefined ? sanitizeString(block.url, "block.url") : undefined,
+    };
 }
 
 /*
@@ -199,49 +173,51 @@ function sanitizeBlock(raw: unknown): { text?: string; mimeType?: string; url?: 
  */
 export function responseToChatBlocks(completion: any) {
     // First we try to parse completion as JSON in case we're dealing with an object.
-    console.log("got completoin", completion, typeof completion)
     if (typeof completion == "string") {
         try {
             completion = JSON.parse(completion)
         } catch {
             // Do nothing; we'll just treat it as a string.
-            console.log("Couldn't parse")
         }
     }
     let blocks = []
     if (typeof completion == "string") {
         console.log("still string")
-        blocks.push(<ChatBlock text={completion} />)
-    } else if (Array.isArray(completion)) {
+        const safeText = sanitizeString(completion, "completion text");
+        blocks.push(<ChatBlock text={safeText} />)
+            } else if (Array.isArray(completion)) {
         console.log("Is array")
-                for (let block of completion) {
+        for (let block of completion) {
             console.log(block)
-            if (block && typeof block === "object" && !Array.isArray(block)) {
-                const safeText: string | undefined = typeof block.text === "string" ? block.text : undefined;
-                const safeMimeType: string | undefined = typeof block.mimeType === "string" ? block.mimeType : undefined;
-                const safeUrl: string | undefined = typeof block.url === "string" ? block.url : undefined;
-                blocks.push(<ChatBlock text={safeText} mimeType={safeMimeType} url={safeUrl} />)
-            }
-        }
-    } else if (completion && typeof completion === "object" && !Array.isArray(completion)) {
-        const safeText: string | undefined = typeof completion.text === "string" ? completion.text : undefined;
-        const safeMimeType: string | undefined = typeof completion.mimeType === "string" ? completion.mimeType : undefined;
-        const safeUrl: string | undefined = typeof completion.url === "string" ? completion.url : undefined;
-        blocks.push(<ChatBlock text={safeText} mimeType={safeMimeType} url={safeUrl} />)
-    } />)
-            } else {
-                console.warn("[ChatBlock] Skipped unsafe or invalid block from LLM output.");
-            }
+            // Extract only known-safe props to prevent prototype pollution
+            // and injection of arbitrary React props (e.g. onError, __proto__).
+            const safeBlock = {
+                text: typeof block.text === "string" ? block.text : undefined,
+                mimeType: typeof block.mimeType === "string" ? block.mimeType : undefined,
+                url: typeof block.url === "string" ? block.url : undefined,
+            };
+            blocks.push(<ChatBlock {...safeBlock} />)
         }
     } else {
-        const safeCompletion = sanitizeBlock(completion);
-        if (safeCompletion !== null) {
-            blocks.push(<ChatBlock {...safeCompletion} />)
-        } else {
-            console.warn("[ChatBlock] Skipped unsafe or invalid completion object from LLM output.");
+        // Extract only known-safe props to prevent prototype pollution
+        // and injection of arbitrary React props from untrusted LLM output.
+        const safeCompletion = {
+            text: typeof completion.text === "string" ? completion.text : undefined,
+            mimeType: typeof completion.mimeType === "string" ? completion.mimeType : undefined,
+            url: typeof completion.url === "string" ? completion.url : undefined,
+        };
+        blocks.push(<ChatBlock {...safeCompletion} />)
+    } else if (Array.isArray(completion)) {
+        for (const block of completion) {
+            if (block && typeof block === "object") {
+                const { text, mimeType, url } = block as { text?: string; mimeType?: string; url?: string };
+                blocks.push(<ChatBlock text={text} mimeType={mimeType} url={url} />)
+            }
         }
+    } else if (completion && typeof completion === "object") {
+        const { text, mimeType, url } = completion as { text?: string; mimeType?: string; url?: string };
+        blocks.push(<ChatBlock text={text} mimeType={mimeType} url={url} />)
     }
-    console.log(blocks)
     return blocks
 }
 
