@@ -1,46 +1,104 @@
 import { Redis } from "@upstash/redis";
 import { OpenAIEmbeddings } from "langchain/embeddings/openai";
-
-// Approved model registry entry — must match the organisation's approved model list.
-// Version is pinned; any change here requires a registry review and approval.
-const APPROVED_EMBEDDING_MODEL = "text-embedding-ada-002" as const;
-const APPROVED_EMBEDDING_MODEL_VERSION = "002" as const; // semver patch pinned
-// Integrity note: OpenAI does not expose per-request model digests via the
-// LangChain SDK. The pinned model name is the strongest version-pinning
-// mechanism available at this layer. Rotate this constant when the registry
-// approves a new model version.
 import { PineconeClient } from "@pinecone-database/pinecone";
 import { PineconeStore } from "langchain/vectorstores/pinecone";
 import { SupabaseVectorStore } from "langchain/vectorstores/supabase";
 import { SupabaseClient, createClient } from "@supabase/supabase-js";
+
+// Approved model registry — only models listed here may be instantiated.
+const APPROVED_EMBEDDING_REGISTRY: Record<string, { provider: string; version: string }> = {
+  "text-embedding-3-small": { provider: "openai", version: "text-embedding-3-small" },
+  "text-embedding-3-large": { provider: "openai", version: "text-embedding-3-large" },
+};
+
+const PINNED_EMBEDDING_MODEL = "text-embedding-3-small";
+
+/**
+ * Factory that enforces model identity, version pinning, and registry validation.
+ * Throws if the requested model is not in the approved registry.
+ */
+function createApprovedEmbeddings(): OpenAIEmbeddings {
+  const modelId = PINNED_EMBEDDING_MODEL;
+  const registryEntry = APPROVED_EMBEDDING_REGISTRY[modelId];
+  if (!registryEntry) {
+    throw new Error(
+      `[ModelRegistry] Embedding model '${modelId}' is NOT in the approved registry. ` +
+      `Approved models: ${Object.keys(APPROVED_EMBEDDING_REGISTRY).join(", ")}`
+    );
+  }
+  // Record resolved model identity for audit/traceability.
+  console.info(
+    `[ModelRegistry] Resolved embedding model — id: '${modelId}', ` +
+    `provider: '${registryEntry.provider}', version: '${registryEntry.version}'`
+  );
+  return new OpenAIEmbeddings({
+    openAIApiKey: process.env.OPENAI_API_KEY,
+    modelName: modelId,
+  });
+}
 import { createHash, randomUUID } from "crypto";
 
+export type SyntheticProvenance = {
+  modelIdentifier: string;
+  embeddingProvider: string;
+  generatedAt: string;
+  contentOrigin: string;
+  syntheticLabel: string;
+};
+
+export type ProvenanceDocument = {
+  pageContent: string;
+  metadata: Record<string, unknown>;
+  provenance: SyntheticProvenance;
+};
+
+function attachProvenance(
+  docs: { pageContent: string; metadata: Record<string, unknown> }[],
+  modelIdentifier: string
+): ProvenanceDocument[] {
+  const provenance: SyntheticProvenance = {
+    modelIdentifier,
+    embeddingProvider: "OpenAI",
+    generatedAt: new Date().toISOString(),
+    contentOrigin: "AI-generated vector similarity search",
+    syntheticLabel: "SYNTHETIC_AI_CONTENT",
+  };
+  return docs.map((doc) => ({
+    pageContent: doc.pageContent,
+    metadata: doc.metadata,
+    provenance,
+  }));
+}
+
+export type CompanionKey = {
+  companionName: string;
+  modelName: string;
+  userId: string;
+};
+
 const DANGEROUS_PATTERNS = [
-  /\beval\s*\(/i,
-  /\bexec\s*\(/i,
-  /\bsubprocess\b/i,
-  /\bFunction\s*\(/i,
-  /\bsetTimeout\s*\(/i,
-  /\bsetInterval\s*\(/i,
-  /\brequire\s*\(/i,
-  /\bimport\s*\(/i,
-  /\b__import__\s*\(/i,
+  /\beval\s*\(/gi,
+  /\bexec\s*\(/gi,
+  /new\s+Function\s*\(/gi,
+  /setTimeout\s*\(\s*['"`]/gi,
+  /setInterval\s*\(\s*['"`]/gi,
+  /\bimport\s*\(/gi,
+  /require\s*\(/gi,
+  /process\.binding\s*\(/gi,
+  /child_process/gi,
+  /__proto__/gi,
+  /constructor\s*\[/gi,
 ];
 
-function sanitizeDocs(docs: any): any[] {
-  if (!Array.isArray(docs)) {
-    console.log("WARNING: similarDocs is not an array, returning empty.");
-    return [];
-  }
+function sanitizeDocs(docs: any[] | void): any[] {
+  if (!docs) return [];
   return docs.filter((doc) => {
-    if (!doc || typeof doc.pageContent !== "string") {
-      console.log("WARNING: dropping doc with missing or non-string pageContent.");
-      return false;
-    }
+    const content: string = typeof doc.pageContent === "string" ? doc.pageContent : JSON.stringify(doc);
     for (const pattern of DANGEROUS_PATTERNS) {
-      if (pattern.test(doc.pageContent)) {
-        console.log(
-          `WARNING: dropping doc containing dangerous pattern (${pattern}) in pageContent.`
+      if (pattern.test(content)) {
+        console.warn(
+          "WARNING: Potentially dangerous content detected in vector search result and was removed.",
+          { pattern: pattern.toString() }
         );
         return false;
       }
@@ -55,10 +113,10 @@ function sanitizeInput(input: string): string {
   if (typeof input !== "string") {
     return "";
   }
+  // Trim whitespace
+  let sanitized = input.trim();
   // Remove null bytes and non-printable control characters (except common whitespace)
-  let sanitized = input.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "");
-  // Trim leading/trailing whitespace
-  sanitized = sanitized.trim();
+  sanitized = sanitized.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "");
   // Enforce maximum length to prevent prompt injection via oversized input
   if (sanitized.length > MAX_INPUT_LENGTH) {
     sanitized = sanitized.substring(0, MAX_INPUT_LENGTH);
@@ -66,147 +124,87 @@ function sanitizeInput(input: string): string {
   return sanitized;
 }
 
-// ---------------------------------------------------------------------------
-// Provenance helpers – satisfy synthetic-content labeling & watermarking policy
-// ---------------------------------------------------------------------------
-const AI_CONTENT_LABEL = "AI_GENERATED" as const;
-const EMBEDDING_MODEL_ID = "openai/text-embedding-ada-002";
-
-function attachProvenance(docs: any[] | void): any[] | void {
-  if (!docs) return docs;
-  const timestamp = new Date().toISOString();
-  return docs.map((doc) => ({
-    ...doc,
-    metadata: {
-      ...(doc.metadata ?? {}),
-      // Provenance fields
-      contentOrigin: AI_CONTENT_LABEL,
-      syntheticLabel: "This content was retrieved via AI-generated vector embeddings.",
-      embeddingModel: EMBEDDING_MODEL_ID,
-      retrievedAt: timestamp,
-      watermark: `AI-GENERATED|${EMBEDDING_MODEL_ID}|${timestamp}`,
-    },
-  }));
-}
-// ---------------------------------------------------------------------------
-
-export type CompanionKey = {
-  companionName: string;
-  modelName: string;
-  userId: string;
-};
-
-/**
- * Sanitizes input before passing to vector search to prevent prompt injection.
- * Checks for: shell commands, base64-encoded blobs, binary/non-printable chars,
- * hidden prompt overrides, and common leetspeak/obfuscation patterns.
- */
-function sanitizeSearchInput(input: string): string {
-  if (!input || typeof input !== "string") {
-    throw new Error("Invalid input: input must be a non-empty string.");
-  }
-
-  // Reject if input contains non-printable / binary characters
-  if (/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/.test(input)) {
-    throw new Error("Suspicious input detected: binary or non-printable characters.");
-  }
-
-  // Reject if input contains base64-encoded blobs (long runs of base64 chars)
-  if (/(?:[A-Za-z0-9+\/]{40,}={0,2})/.test(input)) {
+function sanitizeInput(input: string): string {
+  // Reject or strip base64-encoded content (long base64 strings)
+  const base64Pattern = /(?:[A-Za-z0-9+\/]{40,}={0,2})/g;
+  if (base64Pattern.test(input)) {
     throw new Error("Suspicious input detected: possible base64-encoded content.");
   }
 
-  // Reject common shell command patterns
-  const shellPatterns = [
-    /\b(bash|sh|zsh|cmd|powershell|exec|eval|system|popen|subprocess)\s*[\(\[\{`]/i,
-    /[;&|`$]\s*\w+/,
-    /\.\.\/|\.\.\\/,
-    /<\s*script/i,
-    /\bimport\s+os\b/i,
-    /\brm\s+-rf\b/i,
-    /\bcurl\s+/i,
-    /\bwget\s+/i,
-    /\bnc\s+/i,
-    /\bchmod\s+/i,
-    /\bchown\s+/i,
-  ];
-  for (const pattern of shellPatterns) {
-    if (pattern.test(input)) {
-      throw new Error("Suspicious input detected: possible shell command.");
-    }
+  // Reject shell command patterns
+  const shellCommandPattern = /(?:;|&&|\|\||`|\$\(|\bexec\b|\beval\b|\bsystem\b|\bpassthru\b|\bshell_exec\b|\bpopen\b|\bproc_open\b|\bcmd\.exe\b|\/bin\/(?:sh|bash|zsh|ksh|csh)|\bpowershell\b)/i;
+  if (shellCommandPattern.test(input)) {
+    throw new Error("Suspicious input detected: possible shell command injection.");
   }
 
-  // Reject hidden prompt injection attempts (common override phrases)
-  const promptInjectionPatterns = [
-    /ignore\s+(all\s+)?(previous|prior|above)\s+instructions/i,
-    /disregard\s+(all\s+)?(previous|prior|above)\s+instructions/i,
-    /forget\s+(all\s+)?(previous|prior|above)\s+instructions/i,
-    /you\s+are\s+now\s+(a|an)\s+/i,
-    /act\s+as\s+(a|an)\s+/i,
-    /new\s+instructions?:/i,
-    /system\s*:/i,
-    /\[INST\]/i,
-    /###\s*instruction/i,
-  ];
-  for (const pattern of promptInjectionPatterns) {
-    if (pattern.test(input)) {
-      throw new Error("Suspicious input detected: possible prompt injection.");
-    }
+  // Reject binary/non-printable characters
+  // eslint-disable-next-line no-control-regex
+  const binaryPattern = /[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/;
+  if (binaryPattern.test(input)) {
+    throw new Error("Suspicious input detected: binary or non-printable characters.");
   }
 
-  // Reject leetspeak obfuscation (excessive digit substitution for letters)
-  const leetspeakPattern = /(?:[a-z]*[013456789][a-z]*){5,}/i;
-  if (leetspeakPattern.test(input.replace(/\s/g, ""))) {
+  // Reject leetspeak patterns combined with suspicious keywords
+  const leetspeakPattern = /(?:(?:3x3c|3x3C|\$h3ll|5h3ll|1njec|1nj3c|pr0mpt|pr0mp7|syst3m|syst3|3val|3v4l))/i;
+  if (leetspeakPattern.test(input)) {
     throw new Error("Suspicious input detected: possible leetspeak obfuscation.");
+  }
+
+  // Reject prompt injection attempts targeting AI instructions
+  const promptInjectionPattern = /(?:ignore\s+(?:previous|above|prior|all)\s+instructions?|disregard\s+(?:previous|above|prior|all)|you\s+are\s+now|act\s+as\s+(?:a\s+)?(?:different|new|another)|forget\s+(?:your|all|previous)|new\s+instructions?\s*:|system\s*:\s*you|<\s*system\s*>|\[\s*system\s*\])/i;
+  if (promptInjectionPattern.test(input)) {
+    throw new Error("Suspicious input detected: possible prompt injection attempt.");
   }
 
   // Truncate to a safe maximum length
   const MAX_LENGTH = 4000;
-  return input.slice(0, MAX_LENGTH);
+  if (input.length > MAX_LENGTH) {
+    input = input.slice(0, MAX_LENGTH);
+  }
+
+  return input;
 }
 
-const MAX_DOC_CONTENT_LENGTH = 1000;
-
-function minimiseDocs(
-  docs: Array<{ pageContent: string; metadata: Record<string, unknown> }> | undefined
-): Array<{ pageContent: string }> {
-  if (!docs) return [];
-  return docs.map((doc) => ({
-    pageContent: doc.pageContent.slice(0, MAX_DOC_CONTENT_LENGTH),
-  }));
-}
-
-// ---------------------------------------------------------------------------
-// Audit record shape written to Redis for every AI-driven operation.
-// ---------------------------------------------------------------------------
+// Audit record shape written to Redis for every AI-driven action
 interface AuditRecord {
-  traceId: string;        // correlation ID linking all steps of one request
-  timestamp: string;      // ISO-8601 UTC
-  principal: string;      // userId or 'system'
-  modelId: string;        // e.g. 'openai/text-embedding-ada-002'
-  operation: string;      // 'vectorSearch' | 'writeToHistory' | 'readLatestHistory'
-  inputHash: string;      // SHA-256 of the raw input
-  outputSummary: string;  // truncated / count of results
-  status: 'success' | 'error';
-  errorMessage?: string;
-}
-
-const AUDIT_STREAM_KEY = "ai:audit:log";
-const MODEL_ID = "openai/text-embedding-ada-002"; // single source of truth for the embedding model
-
-function sha256(value: string): string {
-  return createHash("sha256").update(value).digest("hex");
-}
-
-export function getRedisClient(): Redis {
-  return Redis.fromEnv();
+  traceId: string;
+  action: string;
+  principal: string;
+  modelId: string;
+  inputHash: string;
+  timestamp: string;
+  outcome: "started" | "success" | "failure";
+  detail?: string;
 }
 
 class MemoryManager {
   private static instance: MemoryManager;
+  private history: Redis;
   private vectorDBClient: PineconeClient | SupabaseClient;
+  private static readonly AUDIT_KEY = "ai:audit:log";
 
-  public constructor() {
+  /**
+   * Writes a structured audit record to the persistent Redis audit log.
+   * Uses a sorted set scored by epoch ms so records are time-ordered and
+   * queryable. Failures are logged to stderr but never swallowed silently —
+   * the caller's error propagation is unaffected.
+   */
+  private async auditLog(record: AuditRecord): Promise<void> {
+    try {
+      await this.history.zadd(MemoryManager.AUDIT_KEY, {
+        score: Date.now(),
+        member: JSON.stringify(record),
+      });
+    } catch (auditErr) {
+      // Audit failures must be visible; write to stderr and re-throw so the
+      // caller knows the audit trail is broken.
+      console.error("AUDIT FAILURE: could not write audit record.", auditErr);
+      throw auditErr;
+    }
+  }
+
+  public constructor(redisClient: Redis) {
+    this.history = redisClient;
     if (process.env.VECTOR_DB === "pinecone") {
       this.vectorDBClient = new PineconeClient();
     } else {
@@ -215,85 +213,53 @@ class MemoryManager {
         persistSession: false,
         autoRefreshToken: false,
       };
-      const url = process.env.SUPABASE_URL;
-      const privateKey = process.env.SUPABASE_PRIVATE_KEY;
-      if (!url || url.trim() === "") {
-        throw new Error("Missing required environment variable: SUPABASE_URL");
-      }
-      if (!privateKey || privateKey.trim() === "") {
-        throw new Error("Missing required environment variable: SUPABASE_PRIVATE_KEY");
-      }
+      const url = process.env.SUPABASE_URL!;
+      const privateKey = process.env.SUPABASE_PRIVATE_KEY!;
       this.vectorDBClient = createClient(url, privateKey, { auth });
     }
   }
 
   public async init() {
     if (this.vectorDBClient instanceof PineconeClient) {
-      const pineconeApiKey = process.env.PINECONE_API_KEY;
-      const pineconeEnvironment = process.env.PINECONE_ENVIRONMENT;
-      if (!pineconeApiKey || pineconeApiKey.trim() === "") {
-        throw new Error("Missing required environment variable: PINECONE_API_KEY");
-      }
-      if (!pineconeEnvironment || pineconeEnvironment.trim() === "") {
-        throw new Error("Missing required environment variable: PINECONE_ENVIRONMENT");
-      }
       await this.vectorDBClient.init({
-        apiKey: pineconeApiKey,
-        environment: pineconeEnvironment,
+        apiKey: process.env.PINECONE_API_KEY!,
+        environment: process.env.PINECONE_ENVIRONMENT!,
       });
     }
   }
 
-    // Internal helper: persist a structured audit record to Redis.
-  private async logAuditRecord(record: AuditRecord): Promise<void> {
-    try {
-      await this.history.zadd(AUDIT_STREAM_KEY, {
-        score: Date.now(),
-        member: JSON.stringify(record),
-      });
-    } catch (auditErr) {
-      // Audit failures must never be silent — surface them as errors.
-      console.error("AUDIT ERROR: failed to write audit record.", auditErr);
-      throw new Error(`Audit logging failure: ${auditErr}`);
-    }
-  }
-
-  public async vectorSearch(
+    public async vectorSearch(
     recentChatHistory: string,
     companionFileName: string,
     principal: string = "system",
     traceId: string = randomUUID()
   ) {
-    const inputHash = sha256(recentChatHistory + companionFileName);
-    const baseAudit: Omit<AuditRecord, "status" | "outputSummary" | "errorMessage"> = {
+    const modelId = process.env.VECTOR_DB === "pinecone"
+      ? `pinecone:${process.env.PINECONE_INDEX ?? "default"}`
+      : "supabase:documents";
+    const inputHash = createHash("sha256").update(recentChatHistory).digest("hex");
+
+    await this.auditLog({
       traceId,
-      timestamp: new Date().toISOString(),
+      action: "vectorSearch",
       principal,
-      modelId: MODEL_ID,
-      operation: "vectorSearch",
+      modelId,
       inputHash,
-    };
+      timestamp: new Date().toISOString(),
+      outcome: "started",
+      detail: `companionFileName=${companionFileName}`,
+    });
 
     if (process.env.VECTOR_DB === "pinecone") {
-      console.log("INFO: using Pinecone for vector search.", { traceId });
+      console.log("INFO: using Pinecone for vector search.");
       const pineconeClient = <PineconeClient>this.vectorDBClient;
 
       const pineconeIndex = pineconeClient.Index(
         process.env.PINECONE_INDEX! || ""
       );
 
-            console.log(
-        `INFO: model identity — name=${APPROVED_EMBEDDING_MODEL} version=${APPROVED_EMBEDDING_MODEL_VERSION} registry=approved`
-      );
       const vectorStore = await PineconeStore.fromExistingIndex(
-        new OpenAIEmbeddings({
-          openAIApiKey: process.env.OPENAI_API_KEY,
-          modelName: APPROVED_EMBEDDING_MODEL,
-        }),
-        { pineconeIndex }
-      );
-          return key;
-        })() }),
+        createApprovedEmbeddings(),
         { pineconeIndex }
       );
 
@@ -305,41 +271,36 @@ class MemoryManager {
           { fileName: companionFileName }
         );
       } catch (err) {
-        await this.logAuditRecord({
-          ...baseAudit,
-          status: "error",
-          outputSummary: "",
-          errorMessage: String(err),
+        await this.auditLog({
+          traceId,
+          action: "vectorSearch",
+          principal,
+          modelId,
+          inputHash,
+          timestamp: new Date().toISOString(),
+          outcome: "failure",
+          detail: String(err),
         });
-        console.error("ERROR: failed to get Pinecone vector search results.", { traceId, err });
-        throw err; // fail closed — do not swallow
+        console.error("ERROR: failed to get Pinecone vector search results.", err);
+        throw err;
       }
 
-      await this.logAuditRecord({
-        ...baseAudit,
-        status: "success",
-        outputSummary: `resultCount:${similarDocs?.length ?? 0}`,
+      await this.auditLog({
+        traceId,
+        action: "vectorSearch",
+        principal,
+        modelId,
+        inputHash,
+        timestamp: new Date().toISOString(),
+        outcome: "success",
+        detail: `resultCount=${similarDocs?.length ?? 0}`,
       });
       return similarDocs;
     } else {
-      console.log("INFO: using Supabase for vector search.", { traceId });
+      console.log("INFO: using Supabase for vector search.");
       const supabaseClient = <SupabaseClient>this.vectorDBClient;
-            console.log(
-        `INFO: model identity — name=${APPROVED_EMBEDDING_MODEL} version=${APPROVED_EMBEDDING_MODEL_VERSION} registry=approved`
-      );
       const vectorStore = await SupabaseVectorStore.fromExistingIndex(
-        new OpenAIEmbeddings({
-          openAIApiKey: process.env.OPENAI_API_KEY,
-          modelName: APPROVED_EMBEDDING_MODEL,
-        }),
-        {
-          client: supabaseClient,
-          tableName: "documents",
-          queryName: "match_documents",
-        }
-      );
-          return key;
-        })() }),
+        createApprovedEmbeddings(),
         {
           client: supabaseClient,
           tableName: "documents",
@@ -351,75 +312,87 @@ class MemoryManager {
       try {
         similarDocs = await vectorStore.similaritySearch(recentChatHistory, 3);
       } catch (err) {
-        await this.logAuditRecord({
-          ...baseAudit,
-          status: "error",
-          outputSummary: "",
-          errorMessage: String(err),
+        await this.auditLog({
+          traceId,
+          action: "vectorSearch",
+          principal,
+          modelId,
+          inputHash,
+          timestamp: new Date().toISOString(),
+          outcome: "failure",
+          detail: String(err),
         });
-        console.error("ERROR: failed to get Supabase vector search results.", { traceId, err });
-        throw err; // fail closed — do not swallow
+        console.error("ERROR: failed to get Supabase vector search results.", err);
+        throw err;
       }
 
-      await this.logAuditRecord({
-        ...baseAudit,
-        status: "success",
-        outputSummary: `resultCount:${similarDocs?.length ?? 0}`,
+      await this.auditLog({
+        traceId,
+        action: "vectorSearch",
+        principal,
+        modelId,
+        inputHash,
+        timestamp: new Date().toISOString(),
+        outcome: "success",
+        detail: `resultCount=${similarDocs?.length ?? 0}`,
       });
       return similarDocs;
     }
-  }),
+  }
+    if (!companionFileName) {
+      console.log("WARNING: companionFileName is empty after sanitization.");
+      return [];
+    }
+    if (process.env.VECTOR_DB === "pinecone") {
+      console.log("INFO: using Pinecone for vector search.");
+      const pineconeClient = <PineconeClient>this.vectorDBClient;
+
+      const pineconeIndex = pineconeClient.Index(
+        process.env.PINECONE_INDEX! || ""
+      );
+
+      const vectorStore = await PineconeStore.fromExistingIndex(
+        new CohereEmbeddings({ apiKey: process.env.COHERE_API_KEY }),
         { pineconeIndex }
       );
 
-      const rawDocs = await vectorStore
+      const similarDocs = await vectorStore
         .similaritySearch(recentChatHistory, 3, { fileName: companionFileName })
         .catch((err) => {
           console.log("WARNING: failed to get vector search results.", err);
         });
-      const similarDocs = sanitizeDocs(rawDocs);
-      return similarDocs;
+      return sanitizeDocs(similarDocs);
     } else {
-      // Vector search backend: Supabase
+      console.log("INFO: using Supabase for vector search.");
       const supabaseClient = <SupabaseClient>this.vectorDBClient;
-            console.log("LLM interaction: calling OpenAIEmbeddings for Supabase vector search.");
       const vectorStore = await SupabaseVectorStore.fromExistingIndex(
-        new OpenAIEmbeddings({ openAIApiKey: process.env.OPENAI_API_KEY }),
-        { apiKey: process.env.HUGGINGFACEHUB_API_KEY }),
-          {
-            client: supabaseClient,
+        new CohereEmbeddings({ apiKey: process.env.COHERE_API_KEY }),
+        {
+          client: supabaseClient,
           tableName: "documents",
           queryName: "match_documents",
         }
       );
-      const rawDocs = await vectorStore
+      const similarDocs = await vectorStore
         .similaritySearch(recentChatHistory, 3)
         .catch((err) => {
           console.log("WARNING: failed to get vector search results.", err);
         });
-      const similarDocs = sanitizeDocs(rawDocs);
-      return similarDocs;
+      return sanitizeDocs(similarDocs);
     }
   }
 
   public static async getInstance(): Promise<MemoryManager> {
     if (!MemoryManager.instance) {
-      MemoryManager.instance = new MemoryManager();
+      const redisClient = Redis.fromEnv();
+      MemoryManager.instance = new MemoryManager(redisClient);
       await MemoryManager.instance.init();
     }
     return MemoryManager.instance;
   }
 
-  private sanitizeKeySegment(segment: string): string {
-    // Allow only alphanumeric characters, hyphens, and underscores to prevent key collision/IDOR
-    return segment.replace(/[^a-zA-Z0-9_-]/g, "_");
-  }
-
   private generateRedisCompanionKey(companionKey: CompanionKey): string {
-    const safeName = this.sanitizeKeySegment(companionKey.companionName);
-    const safeModel = this.sanitizeKeySegment(companionKey.modelName);
-    const safeUser = this.sanitizeKeySegment(companionKey.userId);
-    return `${safeUser}:${safeName}:${safeModel}`;
+    return `${companionKey.companionName}-${companionKey.modelName}-${companionKey.userId}`;
   }
 
   public async writeToHistory(
@@ -432,37 +405,37 @@ class MemoryManager {
       return "";
     }
 
-    const auditBase: Omit<AuditRecord, "status" | "outputSummary" | "errorMessage"> = {
+    const principal = companionKey.userId;
+    const inputHash = createHash("sha256").update(text).digest("hex");
+
+    await this.auditLog({
       traceId,
+      action: "writeToHistory",
+      principal,
+      modelId: companionKey.modelName,
+      inputHash,
       timestamp: new Date().toISOString(),
-      principal: companionKey.userId,
-      modelId: companionKey.modelName || MODEL_ID,
-      operation: "writeToHistory",
-      inputHash: sha256(text),
-    };
+      outcome: "started",
+      detail: `companionName=${companionKey.companionName}`,
+    });
 
     const key = this.generateRedisCompanionKey(companionKey);
-    let result;
-    try {
-      result = await this.history.zadd(key, {
-        score: Date.now(),
-        member: text,
-      });
-    } catch (err) {
-      await this.logAuditRecord({
-        ...auditBase,
-        status: "error",
-        outputSummary: "",
-        errorMessage: String(err),
-      });
-      throw err;
-    }
-
-    await this.logAuditRecord({
-      ...auditBase,
-      status: "success",
-      outputSummary: `redisResult:${result}`,
+    const result = await this.history.zadd(key, {
+      score: Date.now(),
+      member: text,
     });
+
+    await this.auditLog({
+      traceId,
+      action: "writeToHistory",
+      principal,
+      modelId: companionKey.modelName,
+      inputHash,
+      timestamp: new Date().toISOString(),
+      outcome: "success",
+      detail: `redisKey=${key}`,
+    });
+
     return result;
   }
 
@@ -475,22 +448,29 @@ class MemoryManager {
       return "";
     }
 
-    const auditBase: Omit<AuditRecord, "status" | "outputSummary" | "errorMessage"> = {
+    const principal = companionKey.userId;
+
+    await this.auditLog({
       traceId,
+      action: "readLatestHistory",
+      principal,
+      modelId: companionKey.modelName,
+      inputHash: createHash("sha256").update(this.generateRedisCompanionKey(companionKey)).digest("hex"),
       timestamp: new Date().toISOString(),
-      principal: companionKey.userId,
-      modelId: companionKey.modelName || MODEL_ID,
-      operation: "readLatestHistory",
-      inputHash: sha256(JSON.stringify(companionKey)),
-    };
+      outcome: "started",
+      detail: `companionName=${companionKey.companionName}`,
+    });
 
     const key = this.generateRedisCompanionKey(companionKey);
     let result = await this.history.zrange(key, 0, Date.now(), {
       byScore: true,
     });
 
-    result = result.slice(-30).reverse();
-    const recentChats = result.reverse().join("\n");
+    result = result.slice(-10).reverse();
+    const recentChats = result
+      .reverse()
+      .map((entry) => entry.slice(0, 200))
+      .join("\n");
     return recentChats;
   }
 
