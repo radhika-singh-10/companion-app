@@ -7,13 +7,27 @@ class ConfigManager {
   private config: any;
 
   private constructor() {
-    const safePath = path.resolve(process.cwd(), "companions", "companions.json");
-    const allowedBase = path.resolve(process.cwd(), "companions");
-    if (!safePath.startsWith(allowedBase + path.sep) && safePath !== allowedBase) {
-      throw new Error("Invalid configuration file path.");
-    }
+    const safePath = path.resolve(__dirname, "../../..", "companions", "companions.json");
     const data = fs.readFileSync(safePath, "utf8");
-    this.config = JSON.parse(data);
+    const parsed = JSON.parse(data);
+    // Guard against prototype pollution: reject objects containing dangerous keys
+    const sanitize = (obj: any): any => {
+      if (Array.isArray(obj)) {
+        return obj.map(sanitize);
+      }
+      if (obj !== null && typeof obj === "object") {
+        const clean: Record<string, any> = {};
+        for (const key of Object.keys(obj)) {
+          if (key === "__proto__" || key === "constructor" || key === "prototype") {
+            continue;
+          }
+          clean[key] = sanitize(obj[key]);
+        }
+        return clean;
+      }
+      return obj;
+    };
+    this.config = sanitize(parsed);
   }
 
   public static getInstance(): ConfigManager {
@@ -24,7 +38,7 @@ class ConfigManager {
   }
 
   // Only these fields may be returned to callers — add fields here deliberately.
-  private static readonly ALLOWED_CONFIG_FIELDS: ReadonlyArray<string> = [
+  private static readonly ALLOWED_FIELDS: ReadonlyArray<string> = [
     "name",
     "voice",
     "language",
@@ -33,35 +47,29 @@ class ConfigManager {
     "model",
   ];
 
-  private sanitizeConfig(raw: any): Record<string, unknown> {
-    const sanitized: Record<string, unknown> = {};
-    for (const field of ConfigManager.ALLOWED_CONFIG_FIELDS) {
-      if (Object.prototype.hasOwnProperty.call(raw, field)) {
-        sanitized[field] = raw[field];
+  private minimise(record: any): Partial<Record<string, unknown>> {
+    const safe: Partial<Record<string, unknown>> = {};
+    for (const key of ConfigManager.ALLOWED_FIELDS) {
+      if (Object.prototype.hasOwnProperty.call(record, key)) {
+        safe[key] = record[key];
       }
     }
-    return sanitized;
+    return safe;
   }
-
-  private static readonly ALLOWED_FIELD_NAMES = new Set(["name", "id", "type", "category"]);
 
   public getConfig(fieldName: string, configValue: string) {
     //).filter((c: any) => c.name === companionName);
     try {
-      const dangerousKeys = new Set(["__proto__", "constructor", "prototype"]);
-      if (dangerousKeys.has(fieldName) || !ConfigManager.ALLOWED_FIELD_NAMES.has(fieldName)) {
-        throw new Error("Invalid field name.");
-      }
       if (!!this.config && this.config.length !== 0) {
         const result = this.config.filter(
-          (c: any) => Object.prototype.hasOwnProperty.call(c, fieldName) && c[fieldName] === configValue
+          (c: any) => c[fieldName] === configValue
         );
         if (result.length !== 0) {
-          return this.sanitizeConfig(result[0]);
+          return this.minimise(result[0]);
         }
       }
     } catch (e) {
-      console.error("Configuration lookup failed due to an internal error.");
+      console.error(e instanceof Error ? e.message : "An unknown error occurred in getConfig");
     }
   }
 }
