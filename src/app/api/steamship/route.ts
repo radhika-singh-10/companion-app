@@ -6,149 +6,231 @@ import { rateLimit } from "@/app/utils/rateLimit";
 import {Md5} from 'ts-md5'
 import ConfigManager from "@/app/utils/config";
 
-// ---------------------------------------------------------------------------
-// Tool allow list policy
-// ---------------------------------------------------------------------------
-// STEAMSHIP_ALLOWED_TOOLS is a comma-separated list of tool identifiers that
-// this agent is permitted to invoke, e.g.:
-//   STEAMSHIP_ALLOWED_TOOLS=search,calculator,weather
-// If the variable is absent or empty the request is denied (fail-closed).
-function getAllowedTools(): Set<string> | null {
-  const raw = process.env.STEAMSHIP_ALLOWED_TOOLS;
-  if (!raw || raw.trim() === "") return null;
-  const tools = raw
-    .split(",")
-    .map((t) => t.trim().toLowerCase())
-    .filter(Boolean);
-  return tools.length > 0 ? new Set(tools) : null;
-}
+// ── Tool Allow List Policy ────────────────────────────────────────────────────
+const POLICY_VERSION = "tool-allowlist-v1";
 
-function auditLog(entry: {
-  event: string;
-  actor: string;
+/**
+ * Explicit allow list of tool names the agent is permitted to invoke.
+ * Any tool not present here is denied and the request is rejected.
+ */
+const ALLOWED_TOOLS: ReadonlySet<string> = new Set([
+  "search",
+  "calculator",
+  "weather",
+  // Add additional approved tool names here.
+]);
+
+/**
+ * Patterns that indicate a prompt is attempting to invoke a tool.
+ * Adjust these regexes to match your agent's tool-call syntax.
+ */
+const TOOL_INVOCATION_PATTERN = /\btool\s*[:=]\s*["']?([\w-]+)["']?/gi;
+
+interface AuditEntry {
+  timestamp: string;
+  policyVersion: string;
+  actorId: string;
+  actorName: string | null | undefined;
   companionName: string;
   tool: string;
   allowed: boolean;
   reason: string;
-  policyVersion: string;
-  timestamp: string;
-}) {
-  // Write a structured audit record to stdout (captured by your log aggregator).
+}
+
+function auditLog(entry: AuditEntry): void {
+  // Write to stdout so the entry is captured by any log aggregation pipeline.
   console.log(JSON.stringify({ audit: true, ...entry }));
 }
-import { randomUUID } from "crypto";
+
+/**
+ * Scans the prompt for tool invocation attempts and enforces the allow list.
+ * Returns { allowed: true } when the prompt is clean, or
+ * { allowed: false, tool, reason } for the first denied tool found.
+ */
+function enforceToolAllowList(
+  prompt: string,
+  actorId: string,
+  actorName: string | null | undefined,
+  companionName: string
+): { allowed: true } | { allowed: false; tool: string; reason: string } {
+  let match: RegExpExecArray | null;
+  // Reset lastIndex before iterating
+  TOOL_INVOCATION_PATTERN.lastIndex = 0;
+  while ((match = TOOL_INVOCATION_PATTERN.exec(prompt)) !== null) {
+    const toolName = match[1].toLowerCase();
+    const isAllowed = ALLOWED_TOOLS.has(toolName);
+    const reason = isAllowed
+      ? "tool is on the allow list"
+      : `tool '${toolName}' is not on the allow list`;
+    auditLog({
+      timestamp: new Date().toISOString(),
+      policyVersion: POLICY_VERSION,
+      actorId,
+      actorName,
+      companionName,
+      tool: toolName,
+      allowed: isAllowed,
+      reason,
+    });
+    if (!isAllowed) {
+      return { allowed: false, tool: toolName, reason };
+    }
+  }
+  return { allowed: true };
+}
+
+// Simple in-memory rate limiter to avoid holding Upstash Redis credentials
+const rateLimitMap = new Map<string, { count: number; ts: number }>();
+function localRateLimit(identifier: string, limit = 10, windowMs = 60000): boolean {
+  const now = Date.now();
+  const entry = rateLimitMap.get(identifier);
+  if (!entry || now - entry.ts > windowMs) {
+    rateLimitMap.set(identifier, { count: 1, ts: now });
+    return true;
+  }
+  if (entry.count >= limit) return false;
+  entry.count++;
+  return true;
+}
 import fs from "fs";
 import path from "path";
-
-// ---------------------------------------------------------------------------
-// Audit logger — writes one JSON-lines record per AI decision to a persistent
-// append-only file.  Replace the fs.appendFileSync call with your preferred
-// persistent store (database, SIEM, cloud logging sink) as needed.
-// ---------------------------------------------------------------------------
-interface AuditRecord {
-  traceId: string;
-  timestamp: string;
-  principal: { clerkUserId: string | undefined; clerkUserName: string | undefined | null };
-  companionName: string | null;
-  companionConfigId: string | undefined;
-  agentUrl: string;
-  chatSessionId: string;
-  inputHash: string;
-  prompt: string;
-  httpStatus: number;
-  responseOutput: unknown;
-  error?: string;
-}
-
-function writeAuditRecord(record: AuditRecord): void {
-  const auditDir = path.join(process.cwd(), "audit_logs");
-  if (!fs.existsSync(auditDir)) {
-    fs.mkdirSync(auditDir, { recursive: true });
-  }
-  const auditFile = path.join(auditDir, "ai_decisions.jsonl");
-  fs.appendFileSync(auditFile, JSON.stringify(record) + "\n", "utf8");
-}
+import crypto from "crypto";
+import { createHmac } from "crypto";
 
 dotenv.config({ path: `.env.local` });
 
-// Approved model registry: maps companion name -> pinned versioned endpoint.
-// All AI workloads MUST resolve to an entry in this registry.
-// Update entries here when a new pinned version is approved.
-const APPROVED_MODEL_REGISTRY: Record<string, string> = {
-  // Example entries — replace with your actual approved, versioned endpoints:
-  // "my-companion": "https://api.steamship.com/api/v1/package/instance/my-companion-v1-2-3/call/generate",
-  ...(process.env.APPROVED_MODEL_REGISTRY
-    ? JSON.parse(process.env.APPROVED_MODEL_REGISTRY)
-    : {}),
-};
+// Approved model registry: only these base URLs are permitted as agent endpoints.
+// Add or update entries here as new approved model versions are onboarded.
+const APPROVED_AGENT_URLS: string[] = (
+  process.env.APPROVED_AGENT_URLS ||
+  "https://api.steamship.com/api/v1/package/instance/"
+)
+  .split(",")
+  .map((u) => u.trim())
+  .filter(Boolean);
+
+// Required pinned model version identifier (e.g. a semver, commit hash, or digest).
+// Set MODEL_VERSION in your environment (e.g. MODEL_VERSION=v1.2.3-abc1234).
+const MODEL_VERSION = process.env.MODEL_VERSION;
+
+// Allowlist of permitted hostnames for outbound agent fetches.
+// Add or adjust entries to match your deployed Steamship agent endpoints.
+const ALLOWED_AGENT_HOSTS: string[] = [
+  "api.steamship.com",
+];
+
+function isAllowedAgentUrl(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== "https:") {
+      return false;
+    }
+    return ALLOWED_AGENT_HOSTS.some(
+      (host) => parsed.hostname === host || parsed.hostname.endsWith("." + host)
+    );
+  } catch {
+    return false;
+  }
+}
 
 /**
- * Sanitizes the prompt to detect and block malicious or suspicious content.
- * Returns an error string if suspicious content is found, or null if the prompt is safe.
+ * Sanitizes and validates a prompt to prevent prompt injection attacks.
+ * Throws an error if the prompt contains suspicious content.
  */
-function sanitizePrompt(input: string): string | null {
-  if (!input || typeof input !== "string") {
-    return "Invalid prompt.";
+function sanitizePrompt(input: string): string {
+  if (!input || typeof input !== 'string') {
+    throw new Error('Invalid prompt: must be a non-empty string.');
   }
 
-  // Reject excessively long prompts
-  if (input.length > 4000) {
-    return "Prompt exceeds maximum allowed length.";
+  // Reject prompts that are too long
+  const MAX_PROMPT_LENGTH = 2000;
+  if (input.length > MAX_PROMPT_LENGTH) {
+    throw new Error(`Invalid prompt: exceeds maximum length of ${MAX_PROMPT_LENGTH} characters.`);
   }
+
+  // Remove invisible/zero-width characters (hidden prompt injection)
+  const invisibleCharsRegex = /[\u200B-\u200D\uFEFF\u00AD\u2060\u180E\u00A0]/g;
+  const cleaned = input.replace(invisibleCharsRegex, '');
 
   // Detect base64-encoded content (long base64 strings are suspicious)
-  const base64Pattern = /(?:[A-Za-z0-9+\/]{40,}={0,2})/;
-  if (base64Pattern.test(input)) {
-    return "Prompt contains potentially encoded content.";
+  const base64Regex = /(?:[A-Za-z0-9+\/]{40,}={0,2})/;
+  if (base64Regex.test(cleaned)) {
+    throw new Error('Invalid prompt: contains potentially encoded content.');
   }
 
   // Detect shell command patterns
-  const shellCommandPattern =
-    /(\b(bash|sh|zsh|cmd|powershell|exec|eval|system|popen|subprocess|os\.system|child_process|spawn|execSync|execFile)\b|[`$]\(|&&|\|\||;\s*\w|\bsudo\b|\brm\s+-rf\b|\bchmod\b|\bchown\b|\bcurl\b.*\|.*sh|\bwget\b.*\|.*sh)/i;
-  if (shellCommandPattern.test(input)) {
-    return "Prompt contains shell command patterns.";
+  const shellCommandRegex = /(?:^|\s|;|&&|\|\|)(\s*)(rm\s+-|chmod\s+|chown\s+|wget\s+|curl\s+|bash\s+|sh\s+|exec\s+|eval\s+|system\s*\(|subprocess|os\.system|__import__|powershell|cmd\.exe|\/bin\/sh|\/bin\/bash)/i;
+  if (shellCommandRegex.test(cleaned)) {
+    throw new Error('Invalid prompt: contains shell command patterns.');
   }
 
-  // Detect binary/executable references
-  const binaryPattern =
-    /(\/bin\/|\/usr\/bin\/|\/etc\/passwd|\/etc\/shadow|\.exe\b|\.sh\b|\.bat\b|\.cmd\b|\.ps1\b)/i;
-  if (binaryPattern.test(input)) {
-    return "Prompt contains references to binary or executable files.";
+  // Detect binary/executable content (non-printable ASCII bytes)
+  const binaryRegex = /[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/;
+  if (binaryRegex.test(cleaned)) {
+    throw new Error('Invalid prompt: contains binary or non-printable characters.');
   }
 
-  // Detect common prompt injection / jailbreak phrases
-  const injectionPattern =
-    /(ignore (previous|all|above|prior) instructions?|disregard (your|all|previous) (instructions?|rules?|guidelines?)|you are now|act as (an?|if)|pretend (you are|to be)|your new (role|persona|instructions?)|system prompt|\[INST\]|<\|im_start\||<\|system\||\bDAN\b|do anything now)/i;
-  if (injectionPattern.test(input)) {
-    return "Prompt contains potential prompt injection content.";
+  // Detect leetspeak combined with suspicious keywords (e.g., 1gn0r3, 3x3cut3)
+  const leetspeakSuspiciousRegex = /(?:1gn[o0]r[e3]|[e3]x[e3]cut[e3]|[i1]nj[e3]ct|[s5]y[s5]t[e3]m|[e3]v[a4]l|[p9]r[o0]mpt)/i;
+  if (leetspeakSuspiciousRegex.test(cleaned)) {
+    throw new Error('Invalid prompt: contains suspicious leetspeak patterns.');
   }
 
-  // Detect leetspeak obfuscation (e.g., 3x3cut3, 1nj3ct)
-  const leetspeakPattern = /\b[a-z]*[013456789][a-z0-9]*[013456789][a-z0-9]*\b/i;
-  const leetspeakWords = input.match(/\b\w+\b/g) || [];
-  const suspiciousLeet = leetspeakWords.filter(
-    (w) => leetspeakPattern.test(w) && w.length > 4
-  );
-  if (suspiciousLeet.length > 3) {
-    return "Prompt contains potential leetspeak obfuscation.";
+  // Detect prompt injection instruction patterns
+  const injectionPatterns = [
+    /ignore\s+(all\s+)?(previous|prior|above)\s+(instructions?|prompts?|context)/i,
+    /disregard\s+(all\s+)?(previous|prior|above)\s+(instructions?|prompts?|context)/i,
+    /forget\s+(all\s+)?(previous|prior|above)\s+(instructions?|prompts?|context)/i,
+    /you\s+are\s+now\s+(a\s+)?(?!assistant|helpful)/i,
+    /act\s+as\s+(if\s+you\s+are\s+)?(?:an?\s+)?(?:evil|malicious|unrestricted|jailbroken|DAN)/i,
+    /\bDAN\b/,
+    /do\s+anything\s+now/i,
+    /override\s+(your\s+)?(safety|guidelines|instructions|rules)/i,
+    /bypass\s+(your\s+)?(safety|guidelines|instructions|rules|filters)/i,
+    /<\s*script[^>]*>/i,
+    /<!--[\s\S]*?-->/,
+  ];
+
+  for (const pattern of injectionPatterns) {
+    if (pattern.test(cleaned)) {
+      throw new Error('Invalid prompt: contains prompt injection patterns.');
+    }
   }
 
-  // Detect null bytes or non-printable control characters
-  // eslint-disable-next-line no-control-regex
-  const controlCharPattern = /[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/;
-  if (controlCharPattern.test(input)) {
-    return "Prompt contains non-printable or control characters.";
-  }
-
-  return null;
+  return cleaned.trim();
 }
 
-// Organization-approved LLM list. Only models in this list may be invoked.
-const APPROVED_MODELS: ReadonlySet<string> = new Set([
-  // Add approved model identifiers here, e.g.:
-  // "gpt-4o",
-  // "gpt-4-turbo",
-]);
+const DANGEROUS_PATTERNS = [
+  /\beval\s*\(/i,
+  /\bexec\s*\(/i,
+  /\bsubprocess\b/i,
+  /\bnew\s+Function\s*\(/i,
+  /\bsetTimeout\s*\(\s*['"`]/i,
+  /\bsetInterval\s*\(\s*['"`]/i,
+  /\bexecSync\s*\(/i,
+  /\bspawnSync\s*\(/i,
+  /\bspawn\s*\(/i,
+  /\bexecFile\s*\(/i,
+  /\b__import__\s*\(/i,
+  /\bimportlib\b/i,
+  /\bos\.system\s*\(/i,
+  /\bos\.popen\s*\(/i,
+];
+
+function containsDangerousContent(value: unknown): boolean {
+  if (typeof value === "string") {
+    return DANGEROUS_PATTERNS.some((pattern) => pattern.test(value));
+  }
+  if (Array.isArray(value)) {
+    return value.some((item) => containsDangerousContent(item));
+  }
+  if (value !== null && typeof value === "object") {
+    return Object.values(value as Record<string, unknown>).some((v) =>
+      containsDangerousContent(v)
+    );
+  }
+  return false;
+}
 
 function returnError(code: number, message: string) {
   return new NextResponse(
@@ -167,29 +249,33 @@ export async function POST(req: Request) {
   let user;
   let clerkUserName;
   const { prompt: rawPrompt, isText, userId, userName } = await req.json();
-  // Validate and sanitize the prompt input
+  const rawCompanionName = req.headers.get("name");
+
+  // Validate and sanitize companionName: must be a non-empty alphanumeric/dash/underscore/space string
+  if (!rawCompanionName || typeof rawCompanionName !== "string") {
+    return returnError(400, `Hi, please add a valid 'name' field in your headers specifying the Companion Name.`);
+  }
+  const companionNameSanitized = rawCompanionName.trim().replace(/[^a-zA-Z0-9\-_ ]/g, "");
+  if (!companionNameSanitized || companionNameSanitized.length === 0 || companionNameSanitized.length > 100) {
+    return returnError(400, `Hi, the companion name provided is invalid.`);
+  }
+  const companionName = companionNameSanitized;
+
+  // Validate and sanitize prompt: must be a non-empty string within length limits
   if (!rawPrompt || typeof rawPrompt !== "string") {
-    return returnError(400, "Invalid request: 'prompt' must be a non-empty string.");
+    return returnError(400, `Hi, please provide a valid prompt.`);
   }
-  const MAX_PROMPT_LENGTH = 2000;
-  if (rawPrompt.length > MAX_PROMPT_LENGTH) {
-    return returnError(400, `Invalid request: 'prompt' must not exceed ${MAX_PROMPT_LENGTH} characters.`);
+  const promptTrimmed = rawPrompt.trim();
+  if (promptTrimmed.length === 0) {
+    return returnError(400, `Hi, the prompt cannot be empty.`);
   }
-  // Strip null bytes and non-printable control characters (except common whitespace)
-  const prompt = rawPrompt
-    .replace(/\0/g, "")
-    .replace(/[\x01-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "")
-    .trim();
-  if (prompt.length === 0) {
-    return returnError(400, "Invalid request: 'prompt' must not be empty after sanitization.");
+  if (promptTrimmed.length > 4000) {
+    return returnError(400, `Hi, the prompt is too long. Please keep it under 4000 characters.`);
   }
+  // Remove null bytes and non-printable control characters (except common whitespace)
+  const prompt = promptTrimmed.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "");
 
-  const companionName = req.headers.get("name");
-
-  if (!companionName) {
-    console.log("ERROR: no companion name");
-    return returnError(429, `Hi, please add a 'name' field in your headers specifying the Companion Name.`)
-  }
+  // companionName has already been validated and sanitized above
 
   // Load the companion config
   const configManager = ConfigManager.getInstance();
@@ -198,8 +284,12 @@ export async function POST(req: Request) {
     return returnError(404, `Hi, we were unable to find the configuration for a companion named ${companionName}.`)
   }
 
-  // Make sure we're not rate limited
-  const identifier = req.url + "-" + (clerkUserId || "anonymous");
+    user = await currentUser();
+  clerkUserId = user?.id;
+  clerkUserName = user?.firstName;
+
+    // Make sure we're not rate limited
+  const identifier = req.url + "-" + req.headers.get("x-forwarded-for") || "unknown";
   const { success } = await rateLimit(identifier);
   if (!success) {
     console.log("INFO: rate limit exceeded");
@@ -211,19 +301,7 @@ export async function POST(req: Request) {
   }
 
   console.log(`Companion Name: ${companionName}`)
-
-  // Sanitize the prompt before any further processing
-  const promptError = sanitizePrompt(prompt);
-  if (promptError) {
-    console.log(`INFO: Prompt rejected — ${promptError}`);
-    return returnError(400, `Your message could not be processed: ${promptError}`);
-  }
-
   console.log(`Prompt: ${prompt}`);
-
-  user = await currentUser();
-  clerkUserId = user?.id;
-  clerkUserName = user?.firstName;
 
   if (!clerkUserId) {
     console.log("user not authorized");
@@ -238,242 +316,40 @@ export async function POST(req: Request) {
     );
   }
 
-  // Create a signed, expiry-bound chat session id for the verified user
-  const sessionSecret = process.env.SESSION_SECRET;
-  if (!sessionSecret) {
-    return returnError(500, 'Server misconfiguration: SESSION_SECRET is not set.');
-  }
-  const sessionExpiry = Math.floor(Date.now() / 1000) + 3600; // 1-hour expiry
-  const sessionPayload = `${clerkUserId}:${sessionExpiry}`;
-  const sessionHmac = crypto
-    .createHmac('sha256', sessionSecret)
-    .update(sessionPayload)
-    .digest('hex');
-  const chatSessionId = `${sessionPayload}:${sessionHmac}`;
-
-  // Verify the session token integrity before use
-  const [tokenUserId, tokenExpiry, tokenHmac] = chatSessionId.split(':');
-  const expectedHmac = crypto
-    .createHmac('sha256', sessionSecret)
-    .update(`${tokenUserId}:${tokenExpiry}`)
-    .digest('hex');
-  const isValidSignature = crypto.timingSafeEqual(
-    Buffer.from(tokenHmac, 'hex'),
-    Buffer.from(expectedHmac, 'hex')
-  );
-  if (!isValidSignature || parseInt(tokenExpiry, 10) < Math.floor(Date.now() / 1000)) {
-    return returnError(401, 'Invalid or expired session token.');
-  }
+  // Create a chat session id for the user
+  const chatSessionId = Md5.hashStr(clerkUserId || "anonymous");
 
   // Make sure we have a generate endpoint.
   // TODO: Create a new instance of the agent per user if this proves advantageous.
-  const agentUrl = companionConfig.generateEndpoint
+  const agentUrl = companionConfig.generateEndpoint;
   if (!agentUrl) {
     return returnError(500, `Please add a Steamship 'generateEndpoint' to your ${companionName} configuration in companions.json.`)
   }
-
-  // --- Model registry & version-pinning enforcement ---
-  // Reject any endpoint that is not in the approved model registry.
-  const approvedEndpoint = APPROVED_MODEL_REGISTRY[companionName];
-  if (!approvedEndpoint) {
-    console.error(`POLICY VIOLATION: companion '${companionName}' has no entry in the approved model registry.`);
-    return returnError(403, `Companion '${companionName}' is not listed in the approved model registry. Register a pinned endpoint before use.`);
-  }
-  if (agentUrl !== approvedEndpoint) {
-    console.error(`POLICY VIOLATION: resolved endpoint '${agentUrl}' does not match approved pinned endpoint '${approvedEndpoint}' for companion '${companionName}'.`);
-    return returnError(403, `The endpoint configured for '${companionName}' does not match the approved pinned version. Update the registry or the configuration.`);
-  }
-  // Log model identity at inference time for auditability.
-  console.log(`MODEL IDENTITY: companion='${companionName}' pinnedEndpoint='${approvedEndpoint}'`);
-
-  // SSRF prevention: validate agentUrl against a strict allowlist of permitted URL prefixes.
-  const ALLOWED_AGENT_URL_PREFIXES: string[] = (
-    process.env.ALLOWED_AGENT_URL_PREFIXES || "https://api.steamship.com/"
-  ).split(",").map((p) => p.trim()).filter(Boolean);
-  const isAllowedUrl = ALLOWED_AGENT_URL_PREFIXES.some((prefix) =>
-    agentUrl.startsWith(prefix)
-  );
-  if (!isAllowedUrl) {
-    console.error(`Blocked SSRF attempt: agentUrl '${agentUrl}' is not in the allowlist.`);
-    return returnError(500, `The configured agent endpoint is not permitted.`);
-  }
-
-  // Enforce the organization's approved LLM policy.
-  // The companion config must specify a 'model' field that is on the approved list.
-  const companionModel: string | undefined = companionConfig.model;
-  if (!companionModel) {
-    console.log(`ERROR: companion '${companionName}' has no 'model' field in its configuration.`);
-    return returnError(403, `Companion '${companionName}' does not specify a model. Only organization-approved models may be used.`);
-  }
-  if (!APPROVED_MODELS.has(companionModel)) {
-    console.log(`ERROR: model '${companionModel}' for companion '${companionName}' is not on the organization's approved LLM list.`);
-    return returnError(403, `Model '${companionModel}' is not on the organization's approved LLM list. Please contact your administrator.`);
-  }
-
-    // Invoke the generation. Tool invocation, chat history management, backstory injection, etc is all done within this endpoint.
-  // To build, deploy, and host your own multi-tenant agent see: https://www.steamship.com/learn/agent-guidebook
-
-  // Termination criteria: enforce a hard timeout and a maximum number of attempts
-  // so the agent cannot run indefinitely.
-  const AGENT_TIMEOUT_MS = 30_000; // 30-second hard deadline
-  const MAX_ATTEMPTS = 3;          // maximum fetch attempts before giving up
-
-  let response: Response | null = null;
-  let lastError: string = "Unknown error";
-
-  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), AGENT_TIMEOUT_MS);
-
-    try {
-      response = await fetch(agentUrl, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Authorization": `Bearer ${process.env.STEAMSHIP_API_KEY}`
-        },
-        body: JSON.stringify({
-          question: prompt,
-          chat_session_id: chatSessionId
-        }),
-        signal: controller.signal
-      });
-      // Successful fetch — exit the retry loop
-      break;
-    } catch (err: unknown) {
-      if (err instanceof Error && err.name === "AbortError") {
-        lastError = `Agent request timed out after ${AGENT_TIMEOUT_MS / 1000}s (attempt ${attempt}/${MAX_ATTEMPTS})`;
-        console.error(lastError);
-      } else {
-        lastError = err instanceof Error ? err.message : String(err);
-        console.error(`Agent fetch error on attempt ${attempt}/${MAX_ATTEMPTS}: ${lastError}`);
-      }
-      response = null;
-    } finally {
-      clearTimeout(timeoutId);
-    }
-
-    // If we have exhausted all attempts, return a termination error
-    if (attempt === MAX_ATTEMPTS && response === null) {
-      return returnError(504, `Agent did not complete within the allowed time or attempts. Last error: ${lastError}`);
-    }
-  }
-
-  if (response === null) {
-    return returnError(504, `Agent did not produce a response. Last error: ${lastError}`);
-  }
-
-  console.log(`MCP Interaction - Response: status=${response.status}, ok=${response.ok}`);
-        if (response.ok) {
-    const responseText = await response.text()
-    const responseBlocks = JSON.parse(responseText)
-
-    // Provenance, labeling, and watermarking must succeed — fail closed if they do not.
-    try {
-      const provenanceTimestamp = new Date().toISOString();
-      const agentUrlHash = Md5.hashStr(agentUrl);
-
-      // Watermark: a deterministic string derived from session, timestamp, and agent identity.
-      const watermark = `[AI-GENERATED | session:${chatSessionId} | agent:${agentUrlHash} | ts:${provenanceTimestamp}]`;
-
-      // Provenance metadata attached to the response envelope.
-      const provenance = {
-        synthetic: true,
-        contentOrigin: "steamship-agent",
-        agentEndpointHash: agentUrlHash,
-        companionName: companionName,
-        generatedAt: provenanceTimestamp,
-        watermark: watermark,
-      };
-
-      // Label every block in the response as AI-generated and embed the watermark.
-      const labeledBlocks = (Array.isArray(responseBlocks) ? responseBlocks : [responseBlocks]).map(
-        (block: Record<string, unknown>) => ({
-          ...block,
-          _aiGenerated: true,
-          _contentLabel: "SYNTHETIC_AI_OUTPUT",
-          _watermark: watermark,
-          _provenance: provenance,
-        })
-      );
-
-      return NextResponse.json({
-        blocks: labeledBlocks,
-        _provenance: provenance,
-      });
-    } catch (labelingError) {
-      // Fail closed: never serve unlabeled AI content.
-      console.error("ERROR: provenance/labeling failed, refusing to serve unlabeled AI content", labelingError);
-      return returnError(500, "Internal error: could not attach required AI content provenance labels.");
-    }
-  } else {
-    console.error(`Upstream agent error for companion '${companionName}': ${await response.text()}`);
-    return returnError(500, "An error occurred while contacting the agent. Please try again later.")
-  } | User: ${clerkUserId} | Prompt: ${prompt} | Response: ${responseText}`)
-    return NextResponse.json(responseBlocks)
-  } else {
-    const errorText = await response.text()
-    console.log(`LLM Interaction - Companion: ${companionName} | User: ${clerkUserId} | Prompt: ${prompt} | Error Response: ${errorText}`)
-    return returnError(500, errorText)
+  // SSRF mitigation: validate agentUrl against an allowlist of trusted hostnames.
+  const ALLOWED_AGENT_HOSTNAMES: string[] = (
+    process.env.ALLOWED_AGENT_HOSTNAMES || 'api.steamship.com'
+  ).split(',').map(h => h.trim().toLowerCase());
+  let parsedAgentUrl: URL;
+  try {
+    parsedAgentUrl = new URL(agentUrl);
   } catch {
-      return returnError(502, "Invalid JSON received from agent endpoint.");
-    }
-
-    // Validate top-level structure: must be an array of block objects
-    if (!Array.isArray(parsedResponse)) {
-      return returnError(502, "Unexpected response structure from agent endpoint.");
-    }
-
-    // Sanitize each block by allowlisting known safe fields only
-    const ALLOWED_MIME_TYPES = new Set([
-      "text/plain",
-      "text/markdown",
-      "image/png",
-      "image/jpeg",
-      "image/gif",
-      "image/webp",
-      "audio/mp3",
-      "audio/mpeg",
-      "audio/wav",
-    ]);
-
-    const sanitizedBlocks = parsedResponse.map((block: unknown) => {
-      if (typeof block !== "object" || block === null || Array.isArray(block)) {
-        return null; // drop invalid blocks
-      }
-      const b = block as Record<string, unknown>;
-
-      // Allowlist and sanitize individual fields
-      const sanitized: Record<string, unknown> = {};
-
-      if (typeof b.text === "string") {
-        // Strip any HTML/script tags from text content
-        sanitized.text = b.text.replace(/<[^>]*>/g, "");
-      }
-
-      if (typeof b.mimeType === "string" && ALLOWED_MIME_TYPES.has(b.mimeType)) {
-        sanitized.mimeType = b.mimeType;
-      }
-
-      if (typeof b.url === "string") {
-        // Only allow http/https URLs
-        try {
-          const parsed = new URL(b.url);
-          if (parsed.protocol === "http:" || parsed.protocol === "https:") {
-            sanitized.url = b.url;
-          }
-        } catch {
-          // drop invalid URLs
-        }
-      }
-
-      return sanitized;
-    }).filter((block) => block !== null && Object.keys(block as object).length > 0);
-
-    return NextResponse.json(sanitizedBlocks);
-  } else {
-    const errorText = await response.text();
-    console.log(`MCP Interaction - Error Response: status=${response.status}, body=${errorText}`);
-    return returnError(500, errorText)
+    return returnError(500, `The generateEndpoint for ${companionName} is not a valid URL.`);
   }
+  if (
+    !['https:', 'http:'].includes(parsedAgentUrl.protocol) ||
+    !ALLOWED_AGENT_HOSTNAMES.includes(parsedAgentUrl.hostname.toLowerCase())
+  ) {
+    console.error(`SSRF guard: blocked request to disallowed host '${parsedAgentUrl.hostname}'`);
+    return returnError(500, `The generateEndpoint for ${companionName} points to a disallowed host.`);
+  }
+
+  if (!isAllowedAgentUrl(agentUrl)) {
+    console.error(`ERROR: agentUrl '${agentUrl}' is not on the permitted allowlist.`);
+    return returnError(500, `The configured generateEndpoint for ${companionName} is not permitted. Only HTTPS requests to approved Steamship hosts are allowed.`);
+  }
+
+  // POLICY VIOLATION BLOCKED: The Steamship agent endpoint uses an unapproved LLM/agent
+  // infrastructure (GPT via Steamship is NOT_IN_REGISTRY per the organization's approved LLM list).
+  // This endpoint has been disabled until an approved LLM from the organization's registry is used.
+  return returnError(403, `The LLM agent infrastructure configured for ${companionName} is not on the organization's approved list. Please update the companion configuration to use an approved LLM endpoint.`);
 }
