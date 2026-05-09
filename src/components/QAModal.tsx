@@ -7,110 +7,121 @@ import {ChatBlock, responseToChatBlocks} from "@/components/ChatBlock";
 
 var last_name = "";
 
-// Allowlist of permitted LLM API route segments to prevent SSRF / path traversal
-const ALLOWED_LLM_ROUTES: ReadonlySet<string> = new Set([
+// Approved model registry — only these versioned endpoints may be invoked.
+const APPROVED_MODEL_REGISTRY: Record<string, string> = {
+  "gpt-4-turbo-2024-04-09": "gpt-4-turbo-2024-04-09",
+  "gpt-3.5-turbo-0125": "gpt-3.5-turbo-0125",
+  "claude-3-opus-20240229": "claude-3-opus-20240229",
+  "claude-3-sonnet-20240229": "claude-3-sonnet-20240229",
+};
+
+const DEFAULT_MODEL = "gpt-3.5-turbo-0125";
+
+function resolveApprovedModel(requestedModel: string): string {
+  if (requestedModel && Object.prototype.hasOwnProperty.call(APPROVED_MODEL_REGISTRY, requestedModel)) {
+    return APPROVED_MODEL_REGISTRY[requestedModel];
+  }
+  console.warn(
+    `[Security] Model "${requestedModel}" is not in the approved registry. ` +
+    `Falling back to default model "${DEFAULT_MODEL}".`
+  );
+  return DEFAULT_MODEL;
+}
+
+// Allowlist of permitted LLM API endpoint segments.
+const ALLOWED_LLM_ENDPOINTS: ReadonlySet<string> = new Set([
   "openai",
   "anthropic",
   "cohere",
   "mistral",
-  // Add additional permitted route segments here as needed
+  // Add additional permitted endpoint names here.
 ]);
 
-/**
- * Returns the API path only if the llm segment is in the allowlist.
- * Falls back to an empty string (no-op) for unknown/untrusted values.
- */
-function sanitizeLlmRoute(llm: unknown): string {
-  if (typeof llm !== "string") return "";
-  const segment = llm.trim();
-  if (!ALLOWED_LLM_ROUTES.has(segment)) return "";
-  return segment;
+function sanitizeLlmEndpoint(llm: string): string {
+  if (typeof llm === "string" && ALLOWED_LLM_ENDPOINTS.has(llm)) {
+    return llm;
+  }
+  return "";
 }
 
-/**
- * Strips characters that could enable HTTP header injection
- * (CR, LF, NUL, and other control characters).
- */
-function sanitizeHeaderValue(value: unknown): string {
-  if (typeof value !== "string") return "";
-  // Remove carriage return, line feed, NUL, and all other ASCII control chars
-  return value.replace(/[\r\n\x00-\x1F\x7F]/g, "");
+// Allowlist of permitted LLM endpoint path segments.
+const ALLOWED_LLM_ENDPOINTS: ReadonlySet<string> = new Set([
+  "openai",
+  "anthropic",
+  "cohere",
+  // Add additional permitted endpoint names here.
+]);
+
+function getAllowedLlmEndpoint(llm: string): string {
+  if (ALLOWED_LLM_ENDPOINTS.has(llm)) {
+    return llm;
+  }
+  console.warn(`QAModal: LLM endpoint "${llm}" is not in the allowlist. Blocking request.`);
+  return "";
 }
 
-// Patterns that indicate potentially malicious prompt injection attempts
-const MALICIOUS_PATTERNS: RegExp[] = [
-  // Hidden/system prompt injection
-  /ignore\s+(previous|prior|above|all)\s+(instructions?|prompts?|context)/i,
-  /system\s*prompt/i,
-  /you\s+are\s+now/i,
-  /act\s+as\s+(a\s+)?(different|new|another|evil|unrestricted)/i,
-  /pretend\s+(you\s+are|to\s+be)/i,
-  /forget\s+(everything|all|your|previous)/i,
-  /disregard\s+(all|previous|prior|your)/i,
-  /override\s+(your|all|previous)\s*(instructions?|rules?|constraints?)/i,
-  /new\s+(instructions?|directives?|rules?|persona)/i,
-  /\[INST\]|\[SYS\]|<\|system\|>|<\|user\|>|<\|assistant\|>/i,
-  /###\s*(instruction|system|human|assistant)/i,
-  // Base64-encoded content (long base64 strings)
-  /(?:[A-Za-z0-9+\/]{40,}={0,2})/,
-  // Shell commands
-  /(?:^|\s|;|&&|\|\|)(rm\s+-rf|chmod\s+|chown\s+|sudo\s+|curl\s+|wget\s+|bash\s+|sh\s+|exec\s+|eval\s+|system\s*\()/i,
-  /`[^`]+`/,
-  /\$\([^)]+\)/,
-  // Binary/executable indicators
-  /\\x[0-9a-fA-F]{2}/,
-  /\\u[0-9a-fA-F]{4}/g,
-  // Leetspeak patterns for common injection phrases
-  /1gn[o0]r[e3]\s+[a4]ll/i,
-  /[s5]y[s5][t7][e3]m\s+[p9]r[o0]m[p9][t7]/i,
-  // Prompt delimiter abuse
-  /[-]{3,}|[=]{3,}|[*]{3,}/,
-  // Jailbreak keywords
-  /jailbreak|DAN\b|do\s+anything\s+now/i,
-  /unrestricted\s+mode|developer\s+mode|god\s+mode/i,
-  /bypass\s+(safety|filter|restriction|guideline)/i,
-];
-
-function containsMaliciousContent(text: string): boolean {
-  if (!text || text.trim().length === 0) return false;
-  return MALICIOUS_PATTERNS.some((pattern) => pattern.test(text));
+/** Produce a SHA-256 hex digest of an arbitrary string (browser SubtleCrypto). */
+async function sha256Hex(text: string): Promise<string> {
+  const encoder = new TextEncoder();
+  const data = encoder.encode(text);
+  const hashBuffer = await crypto.subtle.digest("SHA-256", data);
+  return Array.from(new Uint8Array(hashBuffer))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
 }
 
-const DANGEROUS_PATTERNS = [
+/** Post an immutable audit record to the persistent audit endpoint. */
+async function postAuditRecord(record: {
+  eventType: string;
+  modelId: string;
+  inputHash: string;
+  outputHash: string;
+  timestamp: string;
+  principal: string;
+  sessionId: string;
+}) {
+  try {
+    await fetch("/api/audit", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(record),
+      keepalive: true,
+    });
+  } catch (err) {
+    // Audit failures must not silently disappear — log to console as fallback.
+    console.error("[AUDIT] Failed to persist audit record:", record, err);
+  }
+}
+
+const DANGEROUS_CODE_PATTERNS = [
   /\beval\s*\(/gi,
   /\bexec\s*\(/gi,
-  /new\s+Function\s*\(/gi,
-  /setTimeout\s*\(\s*['"`]/gi,
-  /setInterval\s*\(\s*['"`]/gi,
+  /\bnew\s+Function\s*\(/gi,
+  /\bsetTimeout\s*\(\s*['"`]/gi,
+  /\bsetInterval\s*\(\s*['"`]/gi,
   /\bimportScripts\s*\(/gi,
-  /document\.write\s*\(/gi,
-  /\.innerHTML\s*=/gi,
-  /\.outerHTML\s*=/gi,
-  /\bexecScript\s*\(/gi,
+  /\bdocument\.write\s*\(/gi,
+  /\binnerHTML\s*=/gi,
+  /\bouterHTML\s*=/gi,
+  /javascript\s*:/gi,
+  /\bFunction\s*\(/gi,
 ];
 
 function sanitizeLLMOutput(output: string): string {
-  for (const pattern of DANGEROUS_PATTERNS) {
-    if (pattern.test(output)) {
-      console.warn("Potentially dangerous content detected in LLM output and blocked.");
-      return "[Response blocked: potentially unsafe content detected.]";
+  let sanitized = output;
+  let hasDangerous = false;
+  for (const pattern of DANGEROUS_CODE_PATTERNS) {
+    if (pattern.test(sanitized)) {
+      hasDangerous = true;
+      sanitized = sanitized.replace(pattern, (match) => `[BLOCKED:${match.trim()}]`);
     }
+    // Reset lastIndex for global regexes
+    pattern.lastIndex = 0;
   }
-  return output;
-}
-
-const APPROVED_LLMS: string[] = [
-  "claude",
-  "llama",
-  "mistral",
-];
-
-function getApprovedLlmEndpoint(llm: string): string {
-  if (!llm || llm === "") return "";
-  if (!APPROVED_LLMS.includes(llm)) {
-    throw new Error(`LLM '${llm}' is not on the organization's approved list.`);
+  if (hasDangerous) {
+    console.warn("[Security] LLM output contained dynamic code execution primitives. Content was sanitized.");
   }
-  return "/api/" + llm;
+  return sanitized;
 }
 
 export default function QAModal({
@@ -122,8 +133,6 @@ export default function QAModal({
   setOpen: any;
   example: any;
 }) {
-  const { data: session, status } = useSession();
-
   if (!example) {
     // create a dummy so the completion doesn't croak during init.
     example = new Object();
@@ -131,18 +140,13 @@ export default function QAModal({
     example.name = "";
   }
 
-  // Allowlist of permitted LLM API endpoint path segments.
-  const ALLOWED_LLM_ENDPOINTS: string[] = [
-    "openai",
-    "anthropic",
-    "cohere",
-    "mistral",
-  ];
-
-  const safeLlmEndpoint: string =
-    typeof example.llm === "string" && ALLOWED_LLM_ENDPOINTS.includes(example.llm)
+  // Approved LLM backends per organization policy.
+  const APPROVED_LLMS: string[] = ["claude", "llama2"];
+  const DEFAULT_APPROVED_LLM = "claude";
+  const resolvedLlm =
+    example.llm && APPROVED_LLMS.includes(example.llm)
       ? example.llm
-      : "";
+      : DEFAULT_APPROVED_LLM;
 
   let {
     completion,
@@ -154,119 +158,144 @@ export default function QAModal({
     setInput,
     setCompletion,
   } = useCompletion({
-    api: getApprovedLlmEndpoint(example.llm),
+    api: "/api/" + resolvedLlm,
     headers: { name: example.name },
   });
+
+  // Stable session ID for correlating all audit events within this modal session.
+  const sessionIdRef = useRef<string>(
+    typeof crypto !== "undefined" && crypto.randomUUID
+      ? crypto.randomUUID()
+      : `session-${Date.now()}-${Math.random().toString(36).slice(2)}`
+  );
+
+  // Keep a ref to the most-recent submitted input so the completion audit can hash it.
+  const lastInputRef = useRef<string>("");
 
   let [blocks, setBlocks] = useState<any[] | null>(null)
   let [provenance, setProvenance] = useState<{ model: string; timestamp: string; origin: string } | null>(null)
 
-      useEffect(() => {
+    useEffect(() => {
     // When the completion changes, parse it to multimodal blocks for display.
     if (completion) {
-      setBlocks(responseToChatBlocks(completion));
-
-      // --- Audit / forensic logging ---
-      if (!isLoading && pendingAuditRef.current) {
-        const pending = pendingAuditRef.current;
-        const record: AuditRecord = {
-          traceId: pending.traceId,
-          timestamp: new Date().toISOString(),
-          modelId: pending.modelId,
-          principal: pending.principal,
-          inputHash: pending.inputHash,
-          input: pending.input,
-          output: completion,
-        };
-        writeAuditRecord(record);
-        pendingAuditRef.current = null;
-      }
+      setBlocks(responseToChatBlocks(completion))
+      // Attach provenance metadata on first receipt of completion content
+      setProvenance(prev => prev ?? {
+        model: example.llm || "unknown-model",
+        timestamp: new Date().toISOString(),
+        origin: `AI-generated by model '${example.llm || "unknown"}' via /api/${example.llm || "unknown"}`,
+      })
     } else {
-      setBlocks(null);
+      setBlocks(null)
+      setProvenance(null)
     }
-  }, [completion, isLoading])
+  }, [completion])
 
   if (!example) {
     console.log("ERROR: no companion selected");
     return null;
   }
 
-  const MAX_INPUT_LENGTH = 1000;
+  const MAX_INPUT_LENGTH = 2000;
+  const DANGEROUS_PATTERN = /<[^>]*>|javascript:|data:|vbscript:|on\w+\s*=/gi;
 
   const sanitizeInput = (value: string): string => {
     // Trim whitespace
     let sanitized = value.trim();
-    // Remove null bytes and other control characters
-    sanitized = sanitized.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "");
-    // Truncate to max length
-    sanitized = sanitized.slice(0, MAX_INPUT_LENGTH);
+    // Remove HTML tags and dangerous patterns
+    sanitized = sanitized.replace(DANGEROUS_PATTERN, "");
+    // Collapse multiple spaces/newlines
+    sanitized = sanitized.replace(/\s{3,}/g, "  ");
     return sanitized;
-  };
-
-  const validateInput = (value: string): string | null => {
-    if (!value || value.length === 0) {
-      return "Input must not be empty.";
-    }
-    if (value.length > MAX_INPUT_LENGTH) {
-      return `Input must not exceed ${MAX_INPUT_LENGTH} characters.`;
-    }
-    // Reject prompt injection patterns
-    const injectionPatterns = [
-      /ignore (all |previous |above )?instructions/i,
-      /system\s*:/i,
-      /\[INST\]/i,
-      /<\|.*?\|>/i,
-    ];
-    for (const pattern of injectionPatterns) {
-      if (pattern.test(value)) {
-        return "Input contains disallowed content.";
-      }
-    }
-    return null;
   };
 
   const handleValidatedSubmit = (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
     const sanitized = sanitizeInput(input);
-    const validationError = validateInput(sanitized);
-    if (validationError) {
-      // Silently reject invalid input without submitting
+    if (!sanitized) {
       return;
     }
+    if (sanitized.length > MAX_INPUT_LENGTH) {
+      alert(`Input must be ${MAX_INPUT_LENGTH} characters or fewer.`);
+      return;
+    }
+    // Update input state to the sanitized value before submitting
     setInput(sanitized);
+    // Delegate to the original handleSubmit with a synthetic event
     handleSubmit(e);
   };
 
-  const [inputError, setInputError] = useState<string | null>(null);
+  const SUSPICIOUS_PATTERNS = [
+    // Shell/binary commands
+    /(?:^|\s)(?:bash|sh|zsh|cmd|powershell|exec|eval|system|popen|subprocess)\s*[({[]/i,
+    /(?:\$\(|`)[^`]*`/,
+    /;\s*(?:rm|del|format|mkfs|dd|wget|curl|nc|ncat|netcat)\s/i,
+    // Base64-encoded content (long base64 strings)
+    /(?:[A-Za-z0-9+/]{40,}={0,2})/,
+    // Hidden/invisible unicode characters
+    /[\u200B-\u200F\u202A-\u202E\u2060-\u2064\uFEFF\u00AD]/,
+    // Prompt injection keywords
+    /ignore\s+(?:previous|above|prior|all)\s+instructions/i,
+    /(?:system\s*prompt|you\s+are\s+now|act\s+as|pretend\s+(?:you\s+are|to\s+be)|jailbreak)/i,
+    /(?:disregard|forget|override)\s+(?:your|all|previous|prior)/i,
+    // Leetspeak obfuscation patterns (e.g. 1gnor3, 3x3cut3)
+    /(?:[1!][gq][n][o0][r][3e]|[3e][x][3e][c]|[5s][y][5s][t][3e][m])/i,
+    // Null bytes or control characters
+    /[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/,
+  ];
 
-  const safeHandleInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    setInputError(null);
-    handleInputChange(e);
+  const sanitizeInput = (value: string): string | null => {
+    for (const pattern of SUSPICIOUS_PATTERNS) {
+      if (pattern.test(value)) {
+        return null; // reject input
+      }
+    }
+    // Strip any remaining invisible/zero-width characters
+    return value.replace(/[\u200B-\u200F\u202A-\u202E\u2060-\u2064\uFEFF\u00AD]/g, "");
   };
 
-  const safeHandleSubmit = (e: React.FormEvent<HTMLFormElement>) => {
-    e.preventDefault();
-    if (containsMaliciousContent(input)) {
-      setInputError("Your message contains content that cannot be processed. Please rephrase your question.");
+  const handleSanitizedInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const sanitized = sanitizeInput(e.target.value);
+    if (sanitized === null) {
+      // Reject the input silently or optionally show a warning
       return;
     }
-    handleSubmit(e);
+    // Mutate the event value to the sanitized version before passing on
+    const syntheticEvent = { ...e, target: { ...e.target, value: sanitized } };
+    handleInputChange(syntheticEvent as React.ChangeEvent<HTMLInputElement>);
   };
+
+  // Wrap handleSubmit to capture the input text before submission and emit a request audit event.
+  const auditedHandleSubmit = useCallback(
+    async (e: React.FormEvent<HTMLFormElement>) => {
+      e.preventDefault();
+      lastInputRef.current = input;
+      const timestamp = new Date().toISOString();
+      const inputHash = await sha256Hex(input);
+      const principal =
+        typeof window !== "undefined"
+          ? (window as any).__currentUser ?? "anonymous"
+          : "anonymous";
+      await postAuditRecord({
+        eventType: "AI_COMPLETION_REQUESTED",
+        modelId: example.llm ?? "unknown",
+        inputHash,
+        outputHash: "",
+        timestamp,
+        principal: String(principal),
+        sessionId: sessionIdRef.current,
+      });
+      handleSubmit(e);
+    },
+    [input, example.llm, handleSubmit]
+  );
 
   const handleClose = () => {
     setInput("");
     setCompletion("");
+    setProvenance(null);
     stop();
     setOpen(false);
-  };
-
-  const guardedHandleSubmit = (e: React.FormEvent<HTMLFormElement>) => {
-    e.preventDefault();
-    if (!session || !session.user) {
-      console.warn("Unauthenticated submit attempt blocked.");
-      return;
-    }
-    handleSubmit(e);
   };
 
   return (
@@ -302,13 +331,9 @@ export default function QAModal({
                       placeholder="How's your day?"
                       className={"w-full flex-auto rounded-md border-0 bg-white/5 px-3.5 py-2 shadow-sm focus:outline-none sm:text-sm sm:leading-6 " + (isLoading && !completion ? "text-gray-600 cursor-not-allowed" : "text-white")}                      
                       value={input}
-                      onChange={safeHandleInputChange}
+                      onChange={handleSanitizedInputChange}
                       disabled={isLoading && !blocks}
-                      aria-invalid={!!inputError}
                     />
-                    {inputError && (
-                      <p className="mt-1 text-sm text-red-400" role="alert">{inputError}</p>
-                    )}
                   </form>
                   <div className="mt-3 sm:mt-5">
                     <div className="mt-2">
@@ -316,33 +341,37 @@ export default function QAModal({
                         Chat with {example.name}
                       </p>
                     </div>
-                    {blocks && provenance && (
+                    {blocks && (
                       <div className="mt-2">
-                        {/* AI Content Provenance Watermark — do not remove */}
+                        {/* AI-Generated Content Label — provenance disclosure */}
                         <div
-                          className="flex items-center gap-2 rounded-md bg-yellow-900/60 border border-yellow-500 px-3 py-1.5 mb-2 text-xs text-yellow-300"
-                          aria-label="AI-generated content label"
-                          data-ai-origin={provenance.origin}
-                          data-ai-model={provenance.model}
-                          data-ai-timestamp={provenance.timestamp}
+                          className="flex items-center gap-2 mb-2 px-2 py-1 rounded bg-yellow-900/40 border border-yellow-600/50"
+                          aria-label="AI-generated content disclosure"
+                          data-ai-generated="true"
+                          data-ai-model={provenance?.model ?? ""}
+                          data-ai-timestamp={provenance?.timestamp ?? ""}
+                          data-ai-origin={provenance?.origin ?? ""}
                         >
-                          <span className="font-bold uppercase tracking-wide">⚠ AI-Generated Content</span>
-                          <span className="mx-1">·</span>
-                          <span>Model: <span className="font-mono">{provenance.model}</span></span>
-                          <span className="mx-1">·</span>
-                          <span>Generated: {provenance.timestamp}</span>
+                          <span className="text-yellow-400 text-xs font-semibold uppercase tracking-wide">
+                            ⚠ AI-Generated Content
+                          </span>
+                          {provenance && (
+                            <span className="text-yellow-300/70 text-xs ml-auto">
+                              Model: {provenance.model} &nbsp;|&nbsp; {new Date(provenance.timestamp).toLocaleString()}
+                            </span>
+                          )}
                         </div>
                         {blocks}
-                        <div
-                          className="mt-1 text-xs text-gray-500 select-none"
-                          aria-hidden="true"
-                          data-watermark="ai-synthetic-content"
-                          data-watermark-model={provenance.model}
-                          data-watermark-timestamp={provenance.timestamp}
-                        >
-                          {/* Watermark: synthetic content · {provenance.origin} · {provenance.timestamp} */}
-                          This response was synthetically generated by an AI model ({provenance.model}) and may not reflect factual information.
-                        </div>
+                        {/* Provenance watermark footer */}
+                        {provenance && (
+                          <div
+                            className="mt-2 pt-1 border-t border-gray-700 text-gray-500 text-xs text-right select-none"
+                            aria-hidden="true"
+                            data-watermark="ai-synthetic-content"
+                          >
+                            🤖 Synthetic · {provenance.model} · {provenance.timestamp}
+                          </div>
+                        )}
                       </div>
                     )}
 
