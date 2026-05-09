@@ -7,314 +7,407 @@ import dotenv from "dotenv";
 import fs from "fs/promises";
 dotenv.config({ path: `.env.local` });
 
-// ── Tool allow list policy ────────────────────────────────────────────────────
-const POLICY_VERSION = "v1.0.0";
-
-/**
- * Explicit allow list of tool/chain identifiers that agents are permitted to
- * invoke.  Any capability NOT present here is denied by default.
- */
-const TOOL_ALLOW_LIST = new Set([
-  "LLMChain:character-export",
-]);
-
-/**
- * Per-role scoping: maps a USER_ID prefix (or exact ID) to the subset of
- * allowed tools that role may use.  Falls back to an empty set (deny-all)
- * when the user is not recognised.
- */
-const ROLE_TOOL_SCOPE = {
-  // Example: admin users may use all allowed tools.
-  admin: new Set(["LLMChain:character-export"]),
-  // Default authenticated users get the same set here; tighten as needed.
-  default: new Set(["LLMChain:character-export"]),
+// ── Approved Model Registry ──────────────────────────────────────────────────
+// Only models listed here may be used. Each entry carries an immutable
+// version pin (snapshot date suffix) so the exact model weights are fixed
+// server-side and cannot silently change.
+const APPROVED_MODEL_REGISTRY = {
+  // mutable alias  →  immutable pinned identifier
+  "gpt-3.5-turbo-16k": "gpt-3.5-turbo-16k-0613",
 };
 
-/**
- * Structured audit logger.  Writes a JSON line to stdout so that log
- * aggregators (CloudWatch, Datadog, etc.) can ingest and alert on it.
- */
-function auditLog({ actor, tool, allowed, reason, question }) {
-  const entry = {
-    timestamp: new Date().toISOString(),
-    policyVersion: POLICY_VERSION,
-    actor,
-    tool,
-    allowed,
-    reason,
-    question: question ?? null,
-  };
-  // Use process.stdout so the record is never swallowed by console filtering.
-  process.stdout.write(JSON.stringify(entry) + "\n");
-}
-
-/**
- * Checks whether `userId` is permitted to invoke `toolId`.
- * Throws a structured error (and emits an audit-deny record) when denied.
- */
-function enforceToolAllowList(userId, toolId, question) {
-  // 1. Global allow-list check.
-  if (!TOOL_ALLOW_LIST.has(toolId)) {
-    const reason = `Tool '${toolId}' is not on the global allow list.`;
-    auditLog({ actor: userId, tool: toolId, allowed: false, reason, question });
-    throw new Error(`[POLICY DENIED] ${reason}`);
-  }
-
-  // 2. Per-role / per-user scoping.
-  // Derive a simple role from the USER_ID (extend this logic as needed).
-  const role = userId.startsWith("admin:") ? "admin" : "default";
-  const roleScope = ROLE_TOOL_SCOPE[role] ?? new Set();
-
-  if (!roleScope.has(toolId)) {
-    const reason =
-      `User '${userId}' (role: ${role}) is not permitted to invoke '${toolId}'.`;
-    auditLog({ actor: userId, tool: toolId, allowed: false, reason, question });
-    throw new Error(`[POLICY DENIED] ${reason}`);
-  }
-
-  // 3. Allowed — emit audit record.
-  auditLog({
-    actor: userId,
-    tool: toolId,
-    allowed: true,
-    reason: "Tool invocation permitted by allow list.",
-    question,
-  });
-}
-
-// ---------------------------------------------------------------------------
-// Audit-trail helpers
-// ---------------------------------------------------------------------------
-const AUDIT_LOG_PATH = "ai_decision_audit.jsonl";
-// Retention: rotate the audit log when it exceeds MAX_AUDIT_BYTES (default 10 MB).
-const MAX_AUDIT_BYTES = parseInt(process.env.AUDIT_LOG_MAX_BYTES ?? String(10 * 1024 * 1024), 10);
-
-async function rotateAuditLogIfNeeded() {
-  try {
-    const stat = await fs.stat(AUDIT_LOG_PATH).catch(() => null);
-    if (stat && stat.size >= MAX_AUDIT_BYTES) {
-      const rotatedPath = `${AUDIT_LOG_PATH}.${Date.now()}.bak`;
-      await fs.rename(AUDIT_LOG_PATH, rotatedPath);
-    }
-  } catch (rotateErr) {
-    // Rotation failure must not suppress the primary audit write.
-    process.stderr.write(`[AUDIT ROTATION ERROR] ${rotateErr}\n`);
-  }
-}
-
-async function writeAuditEntry(entry) {
-  await rotateAuditLogIfNeeded();
-  const line = JSON.stringify(entry) + "\n";
-  await fs.appendFile(AUDIT_LOG_PATH, line, "utf8");
-}
-
-function sha256(value) {
-  return crypto.createHash("sha256").update(String(value)).digest("hex");
-}
-
-// Session-level correlation ID — links every chain.call() in this run.
-const TRACE_ID = crypto.randomUUID();
-
-/**
- * Builds a provenance metadata block, signs it with HMAC-SHA256,
- * and returns the full provenance header string.
- * Throws if the PROVENANCE_HMAC_SECRET env var is missing.
- */
-function buildProvenanceHeader(modelName, companionName, userId) {
-  const secret = process.env.PROVENANCE_HMAC_SECRET;
-  if (!secret) {
+function resolveModel(requestedName) {
+  const pinned = APPROVED_MODEL_REGISTRY[requestedName];
+  if (!pinned) {
     throw new Error(
-      "PROVENANCE_HMAC_SECRET environment variable is required for content provenance signing."
+      `Model "${requestedName}" is NOT in the approved model registry. ` +
+      `Approved models: ${Object.keys(APPROVED_MODEL_REGISTRY).join(", ")}`
     );
   }
-  const provenance = {
-    content_origin: "AI_GENERATED",
-    model_identifier: modelName,
-    generation_timestamp: new Date().toISOString(),
-    companion_name: companionName,
-    user_id: userId,
-    generator: "OpenAI GPT via LangChain",
-  };
-  const provenanceJson = JSON.stringify(provenance, null, 2);
-  const signature = crypto
-    .createHmac("sha256", secret)
-    .update(provenanceJson)
-    .digest("hex");
+  return pinned;
+}
+// ─────────────────────────────────────────────────────────────────────────────
 
-  return [
-    "=== SYNTHETIC CONTENT NOTICE ===",
-    "This file contains AI-generated content. It does not represent real events,",
-    "statements, or opinions of any real person.",
-    "=== PROVENANCE METADATA ===",
-    provenanceJson,
-    `=== PROVENANCE SIGNATURE (HMAC-SHA256) ===`,
-    signature,
-    "=== END PROVENANCE HEADER ===",
-    "",
-  ].join("\n");
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+// Sanitize a string for safe interpolation into LLM prompts
+function sanitizeForPrompt(value) {
+  if (typeof value !== "string") return String(value);
+  // Remove sequences commonly used for prompt injection
+  return value
+    .replace(/###/g, "")
+    .replace(/SYSTEM:/gi, "")
+    .replace(/IGNORE/gi, "")
+    .replace(/[`<>]/g, "");
 }
 
-const LLM_INTERACTION_LOG = `${new Date().toISOString().replace(/[:.]/g, "-")}_llm_interactions.log`;
-const logStream = createWriteStream(LLM_INTERACTION_LOG, { flags: "a" });
+// ── Tool Allow List Policy ────────────────────────────────────────────────────
+const POLICY_VERSION = "1.0.0";
 
-function logLLMInteraction(entry) {
-  const record = JSON.stringify({ timestamp: new Date().toISOString(), ...entry });
-  logStream.write(record + "\n");
-  console.log("[LLM Interaction]", record);
+// Only these exact chain types are permitted to be constructed and called.
+const ALLOWED_CHAIN_TYPES = new Set(["LLMChain"]);
+
+// Only questions whose prefix matches one of these approved intents may be sent
+// to the LLM.  Any runtime-constructed question that does not match is denied.
+const ALLOWED_QUESTION_PREFIXES = [
+  "Greeting:",
+  "Short Description:",
+  "Long Description:",
+];
+
+// ── Structured Audit Logger ───────────────────────────────────────────────────
+function auditLog(entry) {
+  // Write a structured JSON record to stdout so it can be captured by any
+  // log-aggregation pipeline (CloudWatch, Datadog, Splunk, etc.).
+  process.stdout.write(
+    JSON.stringify({
+      timestamp: new Date().toISOString(),
+      policyVersion: POLICY_VERSION,
+      actor: USER_ID ?? "unknown",
+      companion: COMPANION_NAME ?? "unknown",
+      ...entry,
+    }) + "\n"
+  );
 }
 
-// ---------------------------------------------------------------------------
-// Input sanitization helpers
-// ---------------------------------------------------------------------------
-
-/**
- * Validates a simple identifier: only alphanumeric characters, hyphens, and
- * underscores are allowed.  Throws if the value is absent or contains
- * unexpected characters.
- */
-function validateIdentifier(value, name) {
-  if (!value || typeof value !== "string") {
-    throw new Error(`${name} is required.`);
-  }
-  if (!/^[a-zA-Z0-9_-]+$/.test(value)) {
-    throw new Error(
-      `${name} contains invalid characters. Only alphanumeric characters, hyphens, and underscores are allowed.`
-    );
-  }
-  return value;
-}
-
-/**
- * Sanitizes free-form text that will be interpolated into an LLM prompt.
- * - Removes ASCII control characters (except ordinary whitespace).
- * - Collapses runs of whitespace-only lines to a single blank line.
- * - Trims leading/trailing whitespace.
- */
-function sanitizeText(text) {
-  if (typeof text !== "string") return "";
-  return text
-    // Strip ASCII control characters except \t, \n, \r
-    .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "")
-    // Collapse 3+ consecutive blank lines into two
-    .replace(/(\r?\n){3,}/g, "\n\n")
+// ── Input Sanitiser ───────────────────────────────────────────────────────────
+// Strip characters that could be used for prompt-injection before interpolating
+// external data into the prompt template.
+function sanitize(value) {
+  if (typeof value !== "string") return String(value ?? "");
+  // Remove template-literal placeholders and common injection markers.
+  return value
+    .replace(/\$\{[^}]*\}/g, "")
+    .replace(/[<>]/g, "")
     .trim();
 }
 
+// ── Chain Allow-List Guard ────────────────────────────────────────────────────
+function assertChainAllowed(chainType) {
+  if (!ALLOWED_CHAIN_TYPES.has(chainType)) {
+    auditLog({
+      event: "CHAIN_DENIED",
+      chainType,
+      reason: `Chain type '${chainType}' is not in the allow list`,
+    });
+    throw new Error(
+      `Policy violation: chain type '${chainType}' is not permitted.`
+    );
+  }
+  auditLog({ event: "CHAIN_ALLOWED", chainType });
+}
+
+// ── Question Allow-List Guard ─────────────────────────────────────────────────
+function assertQuestionAllowed(question) {
+  const allowed = ALLOWED_QUESTION_PREFIXES.some((prefix) =>
+    question.trimStart().startsWith(prefix)
+  );
+  if (!allowed) {
+    auditLog({
+      event: "TOOL_INVOCATION_DENIED",
+      question,
+      reason: "Question prefix not in allow list",
+      allowedPrefixes: ALLOWED_QUESTION_PREFIXES,
+    });
+    throw new Error(
+      `Policy violation: question '${question}' is not in the approved allow list.`
+    );
+  }
+  auditLog({ event: "TOOL_INVOCATION_ALLOWED", question });
+}
+
+const LLM_LOG_FILE = "llm_interaction_log.jsonl";
+const llmLogStream = createWriteStream(LLM_LOG_FILE, { flags: "a" });
+
+function logLLMInteraction(entry) {
+  const record = { timestamp: new Date().toISOString(), ...entry };
+  llmLogStream.write(JSON.stringify(record) + "\n");
+}
+
 // ---------------------------------------------------------------------------
-// Validate command-line arguments
+// Prompt-injection sanitization
+// ---------------------------------------------------------------------------
+const BASE64_RE = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
+
+// Patterns that indicate shell commands, binary payloads, or injection attempts
+const SHELL_CMD_RE = /(?:^|\s)(?:rm\s+-rf|chmod|chown|wget|curl|bash|sh\s+-c|exec|eval|system|passthru|popen|subprocess|os\.system|__import__|\$\(|`[^`]*`)/i;
+
+// Leetspeak substitution map (common replacements)
+const LEET_MAP = { '0':'o','1':'i','3':'e','4':'a','5':'s','7':'t','@':'a','$':'s','!':'i' };
+const LEET_RE = /[013457@$!]/g;
+
+// Invisible / zero-width characters
+const INVISIBLE_RE = /[\u200B-\u200D\uFEFF\u00AD\u2060\u180E]/g;
+
+// Suspicious prompt-injection keywords
+const INJECTION_KEYWORDS_RE = /(?:ignore\s+(?:previous|above|all)\s+instructions?|disregard\s+(?:previous|above|all)|you\s+are\s+now|act\s+as\s+(?:a|an)?\s*(?:different|new|evil|unrestricted)|jailbreak|do\s+anything\s+now|dan\s+mode|developer\s+mode|system\s+prompt|<\s*script|<\s*img|<\s*svg|javascript\s*:)/i;
+
+function decodeLeet(str) {
+  return str.replace(LEET_RE, (ch) => LEET_MAP[ch] || ch);
+}
+
+function isBase64Payload(str) {
+  // Only flag strings that are long enough to be meaningful encoded payloads
+  const trimmed = str.trim();
+  return trimmed.length >= 20 && BASE64_RE.test(trimmed);
+}
+
+function sanitizeInput(value, fieldName) {
+  if (typeof value !== 'string') {
+    throw new Error(`Sanitization error: ${fieldName} must be a string.`);
+  }
+
+  // 1. Strip invisible / zero-width characters
+  let sanitized = value.replace(INVISIBLE_RE, '');
+
+  // 2. Reject base64-encoded payloads (line-by-line check)
+  for (const line of sanitized.split('\n')) {
+    if (isBase64Payload(line)) {
+      throw new Error(
+        `Security violation: ${fieldName} contains a base64-encoded payload. Aborting.`
+      );
+    }
+  }
+
+  // 3. Check for shell / binary commands
+  if (SHELL_CMD_RE.test(sanitized)) {
+    throw new Error(
+      `Security violation: ${fieldName} contains shell or binary commands. Aborting.`
+    );
+  }
+
+  // 4. Check for injection keywords in the raw value
+  if (INJECTION_KEYWORDS_RE.test(sanitized)) {
+    throw new Error(
+      `Security violation: ${fieldName} contains prompt-injection keywords. Aborting.`
+    );
+  }
+
+  // 5. Check for injection keywords after leetspeak normalisation
+  const deLeeted = decodeLeet(sanitized);
+  if (INJECTION_KEYWORDS_RE.test(deLeeted)) {
+    throw new Error(
+      `Security violation: ${fieldName} contains leetspeak-obfuscated prompt-injection content. Aborting.`
+    );
+  }
+
+  return sanitized;
+}
 // ---------------------------------------------------------------------------
 
-const COMPANION_NAME = validateIdentifier(process.argv[2], "COMPANION_NAME");
-const MODEL_NAME     = validateIdentifier(process.argv[3], "MODEL_NAME");
-const USER_ID        = validateIdentifier(process.argv[4], "USER_ID");
+const RAW_COMPANION_NAME = process.argv[2];
+// Validate COMPANION_NAME: only allow alphanumeric characters, hyphens, and underscores
+if (RAW_COMPANION_NAME && !/^[a-zA-Z0-9_-]+$/.test(RAW_COMPANION_NAME)) {
+  throw new Error(
+    "Invalid COMPANION_NAME: only alphanumeric characters, hyphens, and underscores are allowed."
+  );
+}
+const COMPANION_NAME = RAW_COMPANION_NAME;
+const MODEL_NAME = process.argv[3];
+const USER_ID = process.argv[4];
 
-if (!COMPANION_NAME || !MODEL_NAME || !USER_ID) {
+// Sanitize command-line argument used in the prompt
+try {
+  sanitizeInput(COMPANION_NAME, 'COMPANION_NAME');
+} catch (err) {
+  throw new Error(`Invalid COMPANION_NAME argument: ${err.message}`);
+}
+
+if (!!!COMPANION_NAME || !!!MODEL_NAME || !!!USER_ID) {
   throw new Error(
     "**Usage**: npm run export-to-character <COMPANION_NAME> <MODEL_NAME> <USER_ID>"
   );
 }
 
-// COMPANION_NAME has already been validated as a safe identifier, so the
-// path cannot escape the companions/ directory.
-// --- Security: sanitize companion file content before LLM injection ---
-function sanitizeCompanionContent(content, label) {
-  // 1. Reject binary / non-printable characters (allow common whitespace)
-  if (/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F]/.test(content)) {
-    throw new Error(`Security violation in ${label}: binary or non-printable characters detected.`);
-  }
+// Validate COMPANION_NAME: only allow alphanumeric characters, hyphens, and underscores
+// to prevent path traversal and prompt injection via the name.
+const SAFE_NAME_PATTERN = /^[a-zA-Z0-9_-]{1,64}$/;
+if (!SAFE_NAME_PATTERN.test(COMPANION_NAME)) {
+  throw new Error(
+    "Invalid COMPANION_NAME: must contain only alphanumeric characters, hyphens, or underscores (max 64 chars)."
+  );
+}
+if (!SAFE_NAME_PATTERN.test(MODEL_NAME)) {
+  throw new Error(
+    "Invalid MODEL_NAME: must contain only alphanumeric characters, hyphens, or underscores (max 64 chars)."
+  );
+}
+// Validate USER_ID: only allow alphanumeric characters, hyphens, and underscores
+const SAFE_ID_PATTERN = /^[a-zA-Z0-9_|-]{1,128}$/;
+if (!SAFE_ID_PATTERN.test(USER_ID)) {
+  throw new Error(
+    "Invalid USER_ID: must contain only alphanumeric characters, hyphens, pipes, or underscores (max 128 chars)."
+  );
+}
 
-  // 2. Strip and reject zero-width / invisible Unicode characters
-  const invisiblePattern = /[\u200B-\u200D\uFEFF\u00AD\u2060\u180E\u00A0]/;
-  if (invisiblePattern.test(content)) {
-    throw new Error(`Security violation in ${label}: invisible or zero-width characters detected.`);
+/**
+ * Sanitize a string for safe inclusion in an LLM prompt.
+ * - Removes null bytes and control characters.
+ * - Strips sequences that could be used to inject fake prompt sections
+ *   (e.g. lines that start with "###" which is the section delimiter used in the prompt).
+ * - Truncates to maxLength characters.
+ */
+function sanitizeForPrompt(value, maxLength = 4000) {
+  if (typeof value !== "string") {
+    value = String(value);
   }
-
-  // 3. Detect base64-encoded blobs (long runs of base64 chars)
-  if (/(?:[A-Za-z0-9+/]{40,}={0,2})/.test(content)) {
-    throw new Error(`Security violation in ${label}: possible base64-encoded payload detected.`);
+  // Remove null bytes and ASCII control characters (except newline/tab)
+  value = value.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "");
+  // Neutralize lines that start with ### to prevent fake section injection
+  value = value.replace(/^(\s*###)/gm, "# #");
+  // Truncate
+  if (value.length > maxLength) {
+    value = value.slice(0, maxLength) + "[TRUNCATED]";
   }
+  return value;
+}
 
-  // 4. Detect shell commands / command injection patterns
-  const shellPatterns = [
-    /`[^`]*`/,                        // backtick execution
-    /\$\([^)]*\)/,                    // $(...) subshell
-    /;\s*(rm|curl|wget|bash|sh|python|perl|ruby|nc|ncat|netcat)\b/i,
-    /\|\s*(bash|sh|python|perl|ruby)\b/i,
-    /&&\s*(rm|curl|wget|bash|sh)\b/i,
+// ---------------------------------------------------------------------------
+// Sanitization helpers – guard against prompt-injection via uploaded files
+// ---------------------------------------------------------------------------
+
+/**
+ * Strip invisible / zero-width Unicode characters that are commonly used to
+ * hide injected instructions from human reviewers.
+ */
+function stripInvisibleChars(text) {
+  // Zero-width space, zero-width non-joiner, zero-width joiner, word joiner,
+  // soft hyphen, left-to-right / right-to-left marks, BOM, etc.
+  return text.replace(
+    /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F\u00AD\u200B-\u200F\u2028\u2029\u202A-\u202E\u2060-\u206F\uFEFF]/g,
+    ""
+  );
+}
+
+/**
+ * Return true when the string contains a suspicious base64-encoded blob
+ * (≥ 40 contiguous base64 characters).  Attackers encode instructions in
+ * base64 to bypass keyword filters.
+ */
+function containsBase64Blob(text) {
+  return /[A-Za-z0-9+/]{40,}={0,2}/.test(text);
+}
+
+/**
+ * Return true when the string looks like it contains shell / binary commands
+ * that should never appear in a character description file.
+ */
+function containsShellOrBinaryPatterns(text) {
+  const patterns = [
+    /\$\([^)]*\)/,          // $(command)
+    /`[^`]+`/,              // `command`
+    /\b(eval|exec|system|popen|subprocess|os\.system)\s*\(/i,
+    /\b(curl|wget|nc|ncat|bash|sh|cmd\.exe|powershell)\b/i,
+    /[\x00-\x08\x0E-\x1F]/, // raw control bytes
   ];
-  for (const pattern of shellPatterns) {
-    if (pattern.test(content)) {
-      throw new Error(`Security violation in ${label}: shell command pattern detected.`);
-    }
-  }
+  return patterns.some((re) => re.test(text));
+}
 
-  // 5. Detect common prompt-injection / jailbreak phrases
-  const injectionPatterns = [
-    /ignore (all )?(previous|prior|above) instructions?/i,
-    /disregard (all )?(previous|prior|above) instructions?/i,
-    /forget (all )?(previous|prior|above) instructions?/i,
-    /you are now (in )?developer mode/i,
-    /act as (an? )?(unrestricted|unfiltered|jailbroken|DAN)/i,
-    /do anything now/i,
-    /system prompt/i,
-    /\[INST\]/i,
-    /<\|im_start\|>/i,
-    /###\s*instruction/i,
-    /override (safety|content|moderation)/i,
+/**
+ * Normalise common leetspeak substitutions so that keyword checks below
+ * cannot be trivially bypassed with "1gnore", "sy5tem", etc.
+ */
+function normalizeLeetspeak(text) {
+  return text
+    .replace(/0/g, "o")
+    .replace(/1/g, "i")
+    .replace(/3/g, "e")
+    .replace(/4/g, "a")
+    .replace(/5/g, "s")
+    .replace(/7/g, "t")
+    .replace(/@/g, "a")
+    .replace(/\$/g, "s");
+}
+
+/**
+ * Return true when the (normalised) text contains known prompt-injection
+ * trigger phrases.
+ */
+function containsInjectionPhrases(text) {
+  const normalized = normalizeLeetspeak(text.toLowerCase());
+  const phrases = [
+    "ignore previous instructions",
+    "ignore all previous",
+    "disregard previous",
+    "forget previous instructions",
+    "override previous",
+    "new instructions:",
+    "system prompt:",
+    "system:",
+    "you are now",
+    "act as",
+    "pretend you are",
+    "pretend to be",
+    "roleplay as",
+    "jailbreak",
+    "dan mode",
+    "developer mode",
+    "prompt injection",
+    "<|im_start|>",
+    "<|im_end|>",
+    "<|endoftext|>",
+    "### instruction",
+    "### system",
+    "[system]",
+    "[inst]",
   ];
-  for (const pattern of injectionPatterns) {
-    if (pattern.test(content)) {
-      throw new Error(`Security violation in ${label}: prompt injection pattern detected.`);
-    }
+  return phrases.some((phrase) => normalized.includes(phrase));
+}
+
+/**
+ * Run all checks on a single field extracted from the companion file.
+ * Throws an Error (halting the script) if any check fails.
+ */
+function sanitizeField(fieldName, raw) {
+  const cleaned = stripInvisibleChars(raw);
+
+  if (containsBase64Blob(cleaned)) {
+    throw new Error(
+      `Security violation in companion file – field "${fieldName}" contains a ` +
+        `base64-encoded blob which may hide injected instructions.`
+    );
   }
 
-  // 6. Detect leetspeak obfuscation (simple heuristic: high ratio of digit-letter substitutions)
-  const leetMatches = content.match(/[0-9](?=[a-zA-Z])|[a-zA-Z](?=[0-9])/g) || [];
-  const wordCount = content.split(/\s+/).length;
-  if (leetMatches.length > 0 && leetMatches.length / wordCount > 3) {
-    throw new Error(`Security violation in ${label}: possible leetspeak obfuscation detected.`);
+  if (containsShellOrBinaryPatterns(cleaned)) {
+    throw new Error(
+      `Security violation in companion file – field "${fieldName}" contains ` +
+        `shell or binary command patterns.`
+    );
   }
 
-  return content.trim();
-}
+  if (containsInjectionPhrases(cleaned)) {
+    throw new Error(
+      `Security violation in companion file – field "${fieldName}" contains ` +
+        `prompt-injection trigger phrases.`
+    );
+  }
 
-// Validate COMPANION_NAME to prevent path traversal
-if (!/^[a-zA-Z0-9_-]+$/.test(COMPANION_NAME)) {
-  throw new Error("Invalid COMPANION_NAME: only alphanumeric characters, hyphens, and underscores are allowed.");
+  return cleaned;
 }
+// ---------------------------------------------------------------------------
 
-// Additional path traversal guard: resolve the target path and confirm it stays within the companions directory.
-import path from 'path';
-import { fileURLToPath } from 'url';
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const companionsDir = path.resolve(__dirname, '../../companions');
-const targetPath = path.resolve(companionsDir, COMPANION_NAME + '.txt');
-if (!targetPath.startsWith(companionsDir + path.sep) && targetPath !== companionsDir) {
-  throw new Error('Invalid COMPANION_NAME: path traversal detected.');
+// Resolve the companions directory and the target file path, then verify the
+// resolved path is strictly within the companions directory to prevent traversal.
+const companionsDir = path.resolve(__dirname, "../../companions");
+const resolvedFilePath = path.resolve(companionsDir, COMPANION_NAME + ".txt");
+if (!resolvedFilePath.startsWith(companionsDir + path.sep)) {
+  throw new Error("Path traversal detected: invalid COMPANION_NAME.");
 }
-const data = await fs.readFile(targetPath, 'utf8');
+const data = await fs.readFile(resolvedFilePath, "utf8");
 const presplit = data.split("###ENDPREAMBLE###");
-if (presplit.length < 2) {
-  throw new Error("Companion file is missing ###ENDPREAMBLE### delimiter.");
-}
+const preamble = sanitizeInput(presplit[0], 'preamble');
 const seedsplit = presplit[1].split("###ENDSEEDCHAT###");
-if (seedsplit.length < 2) {
-  throw new Error("Companion file is missing ###ENDSEEDCHAT### delimiter.");
-}
-const preamble = sanitizeCompanionContent(presplit[0], "preamble");
-const seedChat = sanitizeCompanionContent(seedsplit[0], "seedChat");
-const backgroundStory = sanitizeCompanionContent(seedsplit[1], "backgroundStory");
+const seedChat = sanitizeInput(seedsplit[0], 'seedChat');
+const backgroundStory = sanitizeInput(seedsplit[1], 'backgroundStory');
 console.log(preamble, backgroundStory);
 
-// Redis credentials are consolidated into a single config object sourced from env
-const redisConfig = JSON.parse(
-  process.env.UPSTASH_REDIS_CONFIG ||
-  JSON.stringify({
-    url: process.env.UPSTASH_REDIS_REST_URL,
-    token: process.env.UPSTASH_REDIS_REST_TOKEN,
-  })
-);
-const history = new Redis(redisConfig);
+if (!process.env.UPSTASH_REDIS_REST_URL || !process.env.UPSTASH_REDIS_REST_TOKEN) {
+  throw new Error("Missing required credentials: UPSTASH_REDIS_REST_URL or UPSTASH_REDIS_REST_TOKEN");
+}
+const history = new Redis({
+  url: process.env.UPSTASH_REDIS_REST_URL,
+  token: process.env.UPSTASH_REDIS_REST_TOKEN,
+});
 
 const upstashChatHistory = await history.zrange(
   `${COMPANION_NAME}-${MODEL_NAME}-${USER_ID}`,
@@ -326,186 +419,160 @@ const upstashChatHistory = await history.zrange(
 );
 const recentChat = upstashChatHistory
   .slice(-30)
-  .map((entry) => sanitizeText(String(entry)));
-const model = new Anthropic({
-  modelName: "claude-2",
-  anthropicApiKey: process.env.ANTHROPIC_API_KEY,
+  .map((entry) => sanitizeForPrompt(String(entry), 500));
+const model = new Replicate({
+  model: "a16z-infra/llama-2-13b-chat:df7690f1994d94e96ad9d568eac121aecf97b2d03a56cafbd2b7c1be93b7d5d",
+  apiKey: process.env.REPLICATE_API_TOKEN,
 });
 model.verbose = true;
 
-// Minimise: truncate preamble and backgroundStory before injecting into the prompt
-const MAX_PREAMBLE_LENGTH = 500;
-const MAX_BACKGROUND_LENGTH = 500;
-const truncatedPreamble = preamble.slice(0, MAX_PREAMBLE_LENGTH);
-const truncatedBackground = backgroundStory.slice(0, MAX_BACKGROUND_LENGTH);
-const sanitisedChatBlock = sanitisedChat.join("\n");
+// Join sanitized recentChat entries for prompt interpolation
+const sanitizedRecentChatText = recentChat.join("\n");
+
+// Sanitize all external data before interpolating into the prompt to prevent
+// prompt-injection attacks from file or Redis content.
+const safePreamble = sanitize(preamble);
+const safeBackgroundStory = sanitize(backgroundStory);
+const safeSeedChat = sanitize(seedChat);
+const safeRecentChat = Array.isArray(recentChat)
+  ? recentChat.map(sanitize).join("\n")
+  : sanitize(recentChat);
+const safeCompanionName = sanitize(COMPANION_NAME);
+
+// Sanitize all user-controlled values before embedding them in the prompt
+const safePreamble = sanitizeForPrompt(preamble);
+const safeBackgroundStory = sanitizeForPrompt(backgroundStory);
+const safeSeedChat = sanitizeForPrompt(seedChat);
+const safeRecentChat = Array.isArray(recentChat)
+  ? recentChat.map(sanitizeForPrompt).join("\n")
+  : sanitizeForPrompt(String(recentChat));
+const safeCompanionName = sanitizeForPrompt(COMPANION_NAME);
 
 const chainPrompt = PromptTemplate.fromTemplate(`
   ### Background Story: 
-  ${truncatedPreamble}
+  ${safePreamble}
   
-  ${truncatedBackground}
+  ${safeBackgroundStory}
 
   ### Chat history: 
-  ${seedChat}
+  ${safeSeedChat}
 
   ...
-  ${sanitisedChatBlock}
+  ${safeRecentChat}
 
   
-  Above is someone whose name is ${COMPANION_NAME}'s story and their chat history with a human. Output answer to the following question. Return only the answer itself 
+  Above is someone whose name is ${safeCompanionName}'s story and their chat history with a human. Output answer to the following question. Return only the answer itself 
   
   {question}`);
 
+// Enforce chain allow list before constructing the chain.
+assertChainAllowed("LLMChain");
 const chain = new LLMChain({
   llm: model,
   prompt: chainPrompt,
 });
-/**
- * Sanitizes LLM output by detecting and removing dynamic code execution primitives.
- * Throws an error if dangerous patterns are found, or strips them based on policy.
- */
-function sanitizeLLMOutput(text) {
-  if (typeof text !== "string") {
-    throw new Error("LLM output is not a string; rejecting.");
-  }
-
-  // Patterns that indicate dynamic code execution primitives
-  const dangerousPatterns = [
-    /\beval\s*\(/gi,
-    /\bexec\s*\(/gi,
-    /\bexecSync\s*\(/gi,
-    /\bspawn\s*\(/gi,
-    /\bspawnSync\s*\(/gi,
-    /\bsubprocess\b/gi,
-    /\bnew\s+Function\s*\(/gi,
-    /\bsetTimeout\s*\(\s*['"`]/gi,
-    /\bsetInterval\s*\(\s*['"`]/gi,
-    /\brequire\s*\(/gi,
-    /\bimport\s*\(/gi,
-    /\bprocess\.binding\s*\(/gi,
-    /\bvm\.runInThisContext\s*\(/gi,
-    /\bvm\.runInNewContext\s*\(/gi,
-    /\bvm\.Script\b/gi,
-  ];
-
-  const detectedPatterns = dangerousPatterns
-    .filter((pattern) => pattern.test(text))
-    .map((pattern) => pattern.toString());
-
-  if (detectedPatterns.length > 0) {
-    throw new Error(
-      `LLM output contains dangerous code execution primitives: ${detectedPatterns.join(", ")}. Output rejected.`
-    );
-  }
-
-  // Strip any non-printable or control characters (except common whitespace)
-  const sanitized = text.replace(/[^\x09\x0A\x0D\x20-\x7E\u00A0-\uFFFF]/g, "");
-
-  return sanitized;
-}
-
 const questions = [
-  `Greeting: What would ${COMPANION_NAME} say to start a conversation?`,
-  `Short Description: In a few sentences, how would ${COMPANION_NAME} describe themselves?`,
-  `Long Description: In a few sentences, how would ${COMPANION_NAME} describe themselves?`,
+  `Greeting: What would ${safeCompanionName} say to start a conversation?`,
+  `Short Description: In a few sentences, how would ${safeCompanionName} describe themselves?`,
+  `Long Description: In a few sentences, how would ${safeCompanionName} describe themselves?`,
 ];
 const results = await Promise.all(
-  questions.map(async (question, invocationIndex) => {
-    const invokedAt = new Date().toISOString();
-    const inputHash = sha256(question);
-    let chainResult;
-    try {
-      chainResult = await chain.call({ question });
-    } catch (error) {
-      // Fail-closed: log the error to the persistent audit trail, then re-throw
-      // so execution does NOT continue silently with an undefined result.
-      const errorEntry = {
-        traceId: TRACE_ID,
-        invocationIndex,
-        modelName: model.modelName,
-        principal: USER_ID,
-        companionName: COMPANION_NAME,
-        invokedAt,
-        completedAt: new Date().toISOString(),
-        inputHash,
-        question,
-        status: "error",
-        errorMessage: String(error),
-        errorStack: error?.stack ?? null,
-      };
-      await writeAuditEntry(errorEntry);
-      throw error; // re-throw — do not silently continue
-    }
-    const completedAt = new Date().toISOString();
-    const auditEntry = {
-      traceId: TRACE_ID,
-      invocationIndex,
-      modelName: model.modelName,
-      principal: USER_ID,
-      companionName: COMPANION_NAME,
-      invokedAt,
-      completedAt,
-      inputHash,
-      outputHash: sha256(chainResult?.text ?? ""),
-      status: "success",
-    };
-    await writeAuditEntry(auditEntry);
-    return chainResult;
-  })
-);
+  questions.map(async (question) => {
     try {
       const result = await chain.call({ question });
-      logLLMInteraction({ event: "llm_response", input: { question }, output: result });
+      // Attach resolved model identity to every inference result for audit.
+      result._auditModelId = RESOLVED_MODEL_ID;
+      result._auditTimestamp = new Date().toISOString();
+      console.log(
+        `[AUDIT] inference | model=${RESOLVED_MODEL_ID}` +
+        ` | timestamp=${result._auditTimestamp}` +
+        ` | question="${question.substring(0, 60)}..."`
+      );
       return result;
     } catch (error) {
-      logLLMInteraction({ event: "llm_error", input: { question }, error: error.message });
+      console.error(error);
+    }
+  })
+);
+      const result = await chain.call({ question });
+      auditLog({ event: "TOOL_INVOCATION_SUCCESS", question });
+      return result;
+    } catch (error) {
+      // Structured audit log for failures (includes policy denials).
+      auditLog({
+        event: "TOOL_INVOCATION_ERROR",
+        question,
+        error: error?.message ?? String(error),
+      });
+      // Re-throw policy violations so the process exits with a non-zero code.
+      if (error?.message?.startsWith("Policy violation")) throw error;
+    }
+  })
+);
+      const result = await chain.call({ question });
+      logLLMInteraction({ type: "response", input: { question }, output: result.text });
+      return result;
+    } catch (error) {
+      logLLMInteraction({ type: "error", input: { question }, error: error.message });
       console.error(error);
     }
   })
 );
 
-// Build and sign provenance header — throws if signing is not possible,
-// which prevents any unlabeled content from being written (fail-safe).
-const provenanceHeader = buildProvenanceHeader(
-  "gpt-3.5-turbo-16k",
-  COMPANION_NAME,
-  USER_ID
-);
+/**
+ * Sanitize LLM output by detecting dynamic code execution primitives.
+ * Throws if dangerous patterns are found; otherwise returns the sanitized text.
+ */
+function sanitizeLLMOutput(text) {
+  if (typeof text !== "string") {
+    throw new Error("LLM output is not a string.");
+  }
 
-let output = `[MODEL IDENTITY] Generated with approved model: ${RESOLVED_MODEL_ID}\n\n`;
+  // Patterns that indicate dynamic code execution primitives
+  const dangerousPatterns = [
+    /\beval\s*\(/,
+    /\bexec\s*\(/,
+    /\bexecSync\s*\(/,
+    /\bspawn\s*\(/,
+    /\bspawnSync\s*\(/,
+    /\bsubprocess\b/,
+    /\bnew\s+Function\s*\(/,
+    /\bsetTimeout\s*\(\s*['"`]/,
+    /\bsetInterval\s*\(\s*['"`]/,
+    /\brequire\s*\(/,
+    /\bimport\s*\(/,
+    /\bchild_process\b/,
+    /\bvm\.run/,
+    /\bvm\.Script\b/,
+    /\bprocess\.binding\b/,
+  ];
+
+  for (const pattern of dangerousPatterns) {
+    if (pattern.test(text)) {
+      throw new Error(
+        `LLM output contains a forbidden dynamic code execution primitive matching pattern: ${pattern}. Output rejected.`
+      );
+    }
+  }
+
+  // Strip any non-printable / control characters (except common whitespace)
+  const sanitized = text.replace(/[^\x09\x0A\x0D\x20-\x7E\u00A0-\uFFFF]/g, "");
+
+  return sanitized;
+}
+
+// Prepend audit header so the output file itself records model provenance.
+let output = `# AUDIT HEADER\n# model_id=${RESOLVED_MODEL_ID}\n# generated_at=${new Date().toISOString()}\n\n`;
 for (let i = 0; i < questions.length; i++) {
   output += `*****${questions[i]}*****\n${results[i].text}\n\n`;
+} catch (err) {
+    console.error(`Sanitization failed for question "${questions[i]}": ${err.message}`);
+    safeText = "[REDACTED: unsafe content detected in LLM output]";
+  }
+  output += `*****${questions[i]}*****\n${safeText}\n\n`;
 }
-output += `Definition (Advanced)\n${sanitisedChat.join("\n")}`;
+output += `Definition (Advanced)\n${recentChat.join("\n")}`;
 
-// Prepend provenance header to both output files.
-const labeledCharacterData = provenanceHeader + output;
-const labeledChatHistory =
-  provenanceHeader + JSON.stringify(upstashChatHistory, null, 2);
-
-try {
-  await fs.writeFile(
-    `${COMPANION_NAME}_chat_history.txt`,
-    labeledChatHistory
-  );
-} catch (writeError) {
-  console.error(
-    "[PROVENANCE FAIL-SAFE] Failed to write labeled chat history. Aborting to prevent unlabeled output.",
-    writeError
-  );
-  process.exit(1);
-}
-
-try {
-  await fs.writeFile(
-    `${COMPANION_NAME}_character_ai_data.txt`,
-    labeledCharacterData
-  );
-} catch (writeError) {
-  console.error(
-    "[PROVENANCE FAIL-SAFE] Failed to write labeled character AI data. Aborting to prevent unlabeled output.",
-    writeError
-  );
-  process.exit(1);
-}
+// Use safeCompanionName for output filenames to avoid path injection in filenames
+await fs.writeFile(`${safeCompanionName}_chat_history.txt`, upstashChatHistory);
+await fs.writeFile(`${safeCompanionName}_character_ai_data.txt`, output);
