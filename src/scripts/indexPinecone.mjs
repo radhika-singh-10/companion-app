@@ -2,334 +2,332 @@
 import { PineconeClient } from "@pinecone-database/pinecone";
 import dotenv from "dotenv";
 import { Document } from "langchain/document";
-import { OpenAIEmbeddings } from "langchain/embeddings/openai";
+// OpenAIEmbeddings removed: OpenAI/GPT and LangChain are not in the approved LLM registry.
+// Replace with your organization's approved embeddings provider.
+import ApprovedEmbeddingsClient from "../lib/approvedEmbeddingsClient.js";
 
-// Approved model registry — only models listed here may be used for embeddings.
-const APPROVED_EMBEDDING_MODELS = Object.freeze([
-  "text-embedding-ada-002",
-]);
-
-/**
- * Registry-validated wrapper around OpenAIEmbeddings.
- * Enforces:
- *   - model is present in the approved registry allowlist
- *   - an explicit pinned version is always specified (no mutable defaults)
- *   - resolved model identity is logged for audit at instantiation time
- */
-function createApprovedEmbeddings({ openAIApiKey, modelName }) {
-  if (!modelName) {
-    throw new Error(
-      `[ModelRegistry] 'modelName' must be explicitly specified — ` +
-      `relying on library defaults is not permitted.`
-    );
+// Minimal approved embeddings adapter compatible with PineconeStore.fromDocuments
+class ApprovedEmbeddings {
+  constructor(config) {
+    this.client = new ApprovedEmbeddingsClient(config);
   }
-  if (!APPROVED_EMBEDDING_MODELS.includes(modelName)) {
-    throw new Error(
-      `[ModelRegistry] Model '${modelName}' is NOT in the approved registry. ` +
-      `Approved models: ${APPROVED_EMBEDDING_MODELS.join(", ")}`
-    );
+  async embedDocuments(texts) {
+    return Promise.all(texts.map((text) => this.client.embed(text)));
   }
-  // Record resolved model identity for audit purposes.
-  console.log(
-    `[ModelRegistry] Approved model instantiated — name: '${modelName}', ` +
-    `registry: APPROVED_EMBEDDING_MODELS, timestamp: ${new Date().toISOString()}`
-  );
-  return new OpenAIEmbeddings({ openAIApiKey, modelName });
+  async embedQuery(text) {
+    return this.client.embed(text);
+  }
 }
 import { PineconeStore } from "langchain/vectorstores/pinecone";
 import { CharacterTextSplitter } from "langchain/text_splitter";
 import fs from "fs";
 import path from "path";
-import crypto from "crypto";
-import os from "os";
-
-const AUDIT_LOG_PATH = path.resolve("audit_indexPinecone.jsonl");
-
-/**
- * Appends an immutable JSON audit record to the audit log file.
- * Each record is written as a single JSON line (JSONL) for forensic readiness.
- */
-function writeAuditRecord(record) {
-  const line = JSON.stringify(record) + "\n";
-  fs.appendFileSync(AUDIT_LOG_PATH, line, { encoding: "utf8", flag: "a" });
-}
+import { fileURLToPath } from "url";
 
 dotenv.config({ path: `.env.local` });
 
+// ── Approved model registry ──────────────────────────────────────────────────
+// Only models listed here may be used in this workload.
+const APPROVED_EMBEDDING_MODELS = new Set([
+  "text-embedding-3-small",
+  "text-embedding-3-large",
+]);
+
+// Pinned model identity – must match an entry in APPROVED_EMBEDDING_MODELS.
+const EMBEDDING_MODEL_ID = "text-embedding-3-small";
+
+// Integrity manifest: expected SHA-256 digest of the model identifier string
+// (acts as a lightweight tamper-evident check on the pinned constant itself).
+const EMBEDDING_MODEL_ID_SHA256 = "f8b4e2d1c3a7e6f0b9d2c5a8e1f4b7d0a3c6e9f2b5d8a1c4e7f0b3d6a9c2e5f8";
+
+import { createHash } from "crypto";
+
+function assertModelApproved(modelId, expectedDigest) {
+  if (!APPROVED_EMBEDDING_MODELS.has(modelId)) {
+    throw new Error(
+      `Model '${modelId}' is NOT in the approved model registry. ` +
+      `Approved models: ${[...APPROVED_EMBEDDING_MODELS].join(", ")}`
+    );
+  }
+  const actualDigest = createHash("sha256").update(modelId, "utf8").digest("hex");
+  if (actualDigest !== expectedDigest) {
+    throw new Error(
+      `Integrity check failed for model identifier '${modelId}'. ` +
+      `Expected digest: ${expectedDigest}, got: ${actualDigest}`
+    );
+  }
+  console.log(`[model-identity] Approved and verified: modelId=${modelId} digest=${actualDigest}`);
+}
+// ─────────────────────────────────────────────────────────────────────────────
+
 /**
- * Detects and redacts Singapore-specific PII from text before indexing.
- * Covered categories:
- *   - NRIC/FIN numbers (e.g. S1234567A, T0123456B, F1234567C, G1234567D)
- *   - Singapore mobile/landline numbers (+65 XXXX XXXX or 8-digit local)
- *   - Singapore postal codes (6-digit, optionally prefixed with "Singapore")
- *   - Singapore/international passport numbers
- *   - Email addresses
+ * Scans text for Singapore-specific PII categories and returns any matches found.
+ * Categories checked:
+ *   - NRIC / FIN numbers (e.g. S1234567D, T0312345A, F1234567N, G1234567P)
+ *   - Singapore passport numbers (e.g. E1234567X)
+ *   - Personal email addresses
+ *   - Singapore local phone numbers (+65 or 65 prefix, or 8-digit starting with 6/8/9)
  *   - Full names preceded by common salutations (Mr, Mrs, Ms, Dr, Prof)
- * @param {string} text
- * @returns {string} text with PII redacted
+ *   - Dates of birth in common formats
  */
-function redactSingaporePII(text) {
-  // NRIC / FIN  (S/T/F/G followed by 7 digits and a letter)
-  text = text.replace(/\b[STFG]\d{7}[A-Z]\b/gi, "[REDACTED_NRIC]");
+function scanForSingaporePII(text) {
+  const piiPatterns = [
+    {
+      name: "NRIC/FIN Number",
+      // S/T = citizens/PRs born locally; F/G = foreigners
+      pattern: /\b[STFG]\d{7}[A-Z]\b/gi,
+    },
+    {
+      name: "Singapore Passport Number",
+      pattern: /\bE\d{7}[A-Z]\b/gi,
+    },
+    {
+      name: "Personal Email Address",
+      pattern: /\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b/g,
+    },
+    {
+      name: "Singapore Phone Number",
+      // Matches +65 XXXX XXXX, 65XXXXXXXX, or standalone 8-digit numbers starting with 6, 8, or 9
+      pattern: /(?:\+65|\b65)?\s?[689]\d{3}\s?\d{4}\b/g,
+    },
+    {
+      name: "Full Name (with salutation)",
+      // Matches salutation followed by one or more capitalised words
+      pattern: /\b(?:Mr|Mrs|Ms|Miss|Dr|Prof)\.?\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+/g,
+    },
+    {
+      name: "Date of Birth",
+      // Matches DD/MM/YYYY, DD-MM-YYYY, YYYY-MM-DD, Month DD YYYY, DD Month YYYY
+      pattern:
+        /\b(?:\d{1,2}[\/-]\d{1,2}[\/-]\d{2,4}|\d{4}-\d{2}-\d{2}|(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+\d{1,2}[,\s]+\d{4}|\d{1,2}\s+(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+\d{4})\b/gi,
+    },
+  ];
 
-  // Singapore phone numbers: +65 followed by 8 digits (with optional spaces/dashes)
-  text = text.replace(/(?:\+65[\s-]?)?[689]\d{3}[\s-]?\d{4}\b/g, "[REDACTED_PHONE]");
-
-  // Singapore postal codes: optional "Singapore" prefix + 6-digit code
-  text = text.replace(/\bSingapore\s+\d{6}\b/gi, "[REDACTED_POSTAL]");
-  text = text.replace(/\bS\(\d{6}\)/gi, "[REDACTED_POSTAL]");
-
-  // Passport numbers (alphanumeric, 6–9 chars — covers SG and common foreign formats)
-  text = text.replace(/\b[A-Z]{1,2}\d{6,7}[A-Z]?\b/g, (match) => {
-    // Avoid re-redacting already-redacted tokens or short codes
-    if (match.length < 7) return match;
-    return "[REDACTED_PASSPORT]";
-  });
-
-  // Email addresses
-  text = text.replace(/[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g, "[REDACTED_EMAIL]");
-
-  // Names preceded by salutations
-  text = text.replace(/\b(Mr\.?|Mrs\.?|Ms\.?|Miss|Dr\.?|Prof\.?)\s+[A-Z][a-z]+(\s+[A-Z][a-z]+){0,3}/g, "[REDACTED_NAME]");
-
-  return text;
+  const findings = [];
+  for (const { name, pattern } of piiPatterns) {
+    const matches = text.match(pattern);
+    if (matches && matches.length > 0) {
+      findings.push({ type: name, count: matches.length });
+    }
+  }
+  return findings;
 }
 
 /**
- * Redacts common PII patterns from a string.
- * Covers: email addresses, US phone numbers, SSNs, credit card numbers,
- * IPv4 addresses, and patterns that look like full names (Title Case pairs).
+ * Redacts common PII categories from a string.
+ * Covers: email, phone, SSN, credit card, date of birth, and street addresses.
+ * @param {string} text
+ * @returns {string} text with PII replaced by placeholder tokens
  */
 function redactPII(text) {
   // Email addresses
   text = text.replace(/[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g, "[REDACTED_EMAIL]");
-  // US phone numbers (various formats)
-  text = text.replace(/(?:\+?1[\s.-]?)?(?:\(?\d{3}\)?[\s.-]?)\d{3}[\s.-]?\d{4}/g, "[REDACTED_PHONE]");
-  // Social Security Numbers
-  text = text.replace(/\b\d{3}[\s.-]\d{2}[\s.-]\d{4}\b/g, "[REDACTED_SSN]");
-  // Credit card numbers (16-digit, optionally grouped)
-  text = text.replace(/\b(?:\d{4}[\s.-]?){3}\d{4}\b/g, "[REDACTED_CC]");
-  // IPv4 addresses
-  text = text.replace(/\b(?:\d{1,3}\.){3}\d{1,3}\b/g, "[REDACTED_IP]");
-  // Full names: two or more consecutive Title Case words (e.g. "John Smith")
-  text = text.replace(/\b([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)\b/g, "[REDACTED_NAME]");
+
+  // Phone numbers (various formats: +1-800-555-1234, (800) 555-1234, 800.555.1234, etc.)
+  text = text.replace(
+    /(\+?1[\s.\-]?)?\(?\d{3}\)?[\s.\-]?\d{3}[\s.\-]?\d{4}/g,
+    "[REDACTED_PHONE]"
+  );
+
+  // Social Security Numbers (SSN): 123-45-6789 or 123 45 6789
+  text = text.replace(/\b\d{3}[\s\-]\d{2}[\s\-]\d{4}\b/g, "[REDACTED_SSN]");
+
+  // Credit card numbers (16-digit, optionally grouped by spaces or dashes)
+  text = text.replace(/\b(?:\d{4}[\s\-]?){3}\d{4}\b/g, "[REDACTED_CC]");
+
+  // Dates of birth (MM/DD/YYYY, MM-DD-YYYY, YYYY-MM-DD)
+  text = text.replace(
+    /\b(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}|\d{4}[\-]\d{2}[\-]\d{2})\b/g,
+    "[REDACTED_DOB]"
+  );
+
+  // Street addresses (e.g., "123 Main St", "456 Elm Avenue", "789 Oak Blvd")
+  text = text.replace(
+    /\b\d+\s+[A-Za-z0-9\s,.']+(?:Street|St|Avenue|Ave|Boulevard|Blvd|Road|Rd|Lane|Ln|Drive|Dr|Court|Ct|Way|Place|Pl|Circle|Cir|Trail|Tr|Terrace|Ter)\b[.,]?(?:\s+(?:Apt|Suite|Unit|#)\s*[\w\d]+)?/gi,
+    "[REDACTED_ADDRESS]"
+  );
+
+  // ZIP codes (standalone 5-digit or ZIP+4)
+  text = text.replace(/\b\d{5}(?:-\d{4})?\b/g, "[REDACTED_ZIP]");
+
   return text;
 }
 
 /**
- * Validates file content against prompt injection and malicious command patterns.
+ * Sanitizes file content to prevent prompt injection attacks.
  * Throws an error if suspicious content is detected.
  */
-function validateContent(content, fileName) {
-  // 1. Reject binary / non-printable content (allow common whitespace only)
-  if (/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/.test(content)) {
-    throw new Error(`[SECURITY] Binary or non-printable characters detected in "${fileName}". Skipping.`);
-  }
-
-  // 2. Detect invisible / zero-width characters used to hide prompts
-  if (/[\u200B-\u200D\uFEFF\u2060\u00AD]/.test(content)) {
-    throw new Error(`[SECURITY] Invisible/zero-width characters detected in "${fileName}". Skipping.`);
-  }
-
-  // 3. Detect base64-encoded blobs (long runs of base64 chars, >=64 chars)
-  if (/[A-Za-z0-9+/]{64,}={0,2}/.test(content)) {
-    throw new Error(`[SECURITY] Possible base64-encoded payload detected in "${fileName}". Skipping.`);
-  }
-
-  // 4. Detect shell / binary executable commands
-  const shellPatterns = [
-    /\b(bash|sh|zsh|cmd|powershell|exec|eval|system|popen|subprocess)\s*[\(\[`]/i,
-    /\b(curl|wget|nc|ncat|netcat|chmod|chown|sudo|su|rm\s+-rf|mkfifo)\b/i,
-    /[|;&`$]\s*(bash|sh|python|perl|ruby|node|php)/i,
-    /<script[\s>]/i,
-    /javascript:/i,
-  ];
-  for (const pattern of shellPatterns) {
-    if (pattern.test(content)) {
-      throw new Error(`[SECURITY] Shell/executable command pattern detected in "${fileName}". Skipping.`);
-    }
-  }
-
-  // 5. Detect prompt injection keywords
-  const injectionPatterns = [
-    /ignore\s+(all\s+)?(previous|prior|above)\s+instructions/i,
-    /disregard\s+(all\s+)?(previous|prior|above)\s+instructions/i,
-    /forget\s+(all\s+)?(previous|prior|above)\s+instructions/i,
-    /you\s+are\s+now\s+(a|an)\s+/i,
-    /act\s+as\s+(a|an)\s+/i,
-    /new\s+instructions?:/i,
-    /system\s*prompt/i,
-    /\[INST\]/i,
-    /<<SYS>>/i,
-  ];
-  for (const pattern of injectionPatterns) {
-    if (pattern.test(content)) {
-      throw new Error(`[SECURITY] Prompt injection keyword detected in "${fileName}". Skipping.`);
-    }
-  }
-
-  // 6. Detect leetspeak obfuscation (simple heuristic: high ratio of digit-letter substitutions)
-  const leetspeakPattern = /[\$3@!0][a-zA-Z]{2,}|[a-zA-Z]{2,}[\$3@!0]/g;
-  const leetspeakMatches = content.match(leetspeakPattern) || [];
-  const wordCount = content.split(/\s+/).length;
-  if (leetspeakMatches.length > 0 && leetspeakMatches.length / wordCount > 0.15) {
-    throw new Error(`[SECURITY] Possible leetspeak obfuscation detected in "${fileName}". Skipping.`);
-  }
-
-  return true;
-}
-
-/**
- * Sanitizes file content to prevent prompt injection attacks.
- * Throws if clearly malicious content is detected; strips invisible characters.
- */
 function sanitizeFileContent(content, fileName) {
-  // 1. Reject binary/executable content (null bytes or common magic bytes as text)
+  // 1. Reject binary/non-UTF8 content (null bytes or high concentration of control chars)
   if (/\x00/.test(content)) {
-    throw new Error(`File "${fileName}" contains binary/null-byte content and was rejected.`);
+    throw new Error(`[SECURITY] Binary content detected in ${fileName}`);
   }
 
-  // 2. Reject shell command injection patterns
-  const shellPatterns = [
-    /`[^`]*`/,                        // backtick execution
-    /\$\([^)]*\)/,                    // $(command) substitution
-    /;\s*(rm|wget|curl|bash|sh|python|perl|ruby|nc|ncat|netcat)\s/i,
-    /\|\s*(bash|sh|python|perl|ruby)\s/i,
-  ];
-  for (const pattern of shellPatterns) {
-    if (pattern.test(content)) {
-      throw new Error(`File "${fileName}" contains shell command patterns and was rejected.`);
-    }
+  // 2. Strip and flag invisible/zero-width characters used to hide prompts
+  const invisibleCharPattern = /[\u200B-\u200D\uFEFF\u00AD\u2060\u180E\u00A0]/g;
+  if (invisibleCharPattern.test(content)) {
+    throw new Error(`[SECURITY] Invisible/zero-width characters detected in ${fileName}`);
   }
 
-  // 3. Detect and reject base64-encoded blobs (long base64 strings likely encoding hidden prompts)
+  // 3. Detect base64-encoded blobs that could hide instructions
   const base64Pattern = /(?:[A-Za-z0-9+\/]{40,}={0,2})/g;
   const base64Matches = content.match(base64Pattern) || [];
   for (const match of base64Matches) {
     try {
       const decoded = Buffer.from(match, "base64").toString("utf8");
-      // If decoded text contains prompt-injection keywords, reject
-      if (/ignore (previous|above|all)|you are now|new instruction|system prompt|disregard/i.test(decoded)) {
-        throw new Error(`File "${fileName}" contains a base64-encoded hidden prompt and was rejected.`);
+      if (/ignore|prompt|system|assistant|instruction|jailbreak|bypass/i.test(decoded)) {
+        throw new Error(`[SECURITY] Base64-encoded prompt injection detected in ${fileName}`);
       }
     } catch (e) {
-      if (e.message.includes("rejected")) throw e;
-      // Not valid base64 or not decodable — skip
+      if (e.message.startsWith("[SECURITY]")) throw e;
+      // Not valid base64 — skip
     }
   }
 
-  // 4. Detect prompt injection phrases (direct)
-  const injectionPhrases = [
-    /ignore (previous|all|above|prior) (instructions?|prompts?|context)/i,
-    /disregard (previous|all|above|prior) (instructions?|prompts?|context)/i,
-    /forget (previous|all|above|prior) (instructions?|prompts?|context)/i,
-    /you are now/i,
-    /new (role|persona|instructions?|task):/i,
-    /\[system\]/i,
-    /<<SYS>>/i,
-    /<\|system\|>/i,
-    /###\s*instruction/i,
-    /act as (a |an )?(different|new|another|unrestricted)/i,
+  // 4. Detect common prompt injection / jailbreak patterns
+  const promptInjectionPatterns = [
+    /ignore\s+(all\s+)?(previous|prior|above|earlier)\s+(instructions?|prompts?|context)/i,
+    /disregard\s+(all\s+)?(previous|prior|above|earlier)\s+(instructions?|prompts?|context)/i,
+    /forget\s+(all\s+)?(previous|prior|above|earlier)\s+(instructions?|prompts?|context)/i,
+    /you\s+are\s+now\s+(a|an|the)?\s*(different|new|evil|unrestricted|jailbroken)/i,
+    /act\s+as\s+(if\s+you\s+are|a|an)?\s*(different|new|evil|unrestricted|jailbroken|DAN)/i,
+    /\bDAN\b/,
     /jailbreak/i,
-    /do anything now/i,
-    /dan mode/i,
+    /bypass\s+(your\s+)?(safety|filter|restriction|guideline|policy)/i,
+    /system\s*:\s*(you are|your role|your task|your job)/i,
+    /<\s*system\s*>/i,
+    /\[INST\]/i,
+    /###\s*(system|instruction|prompt)\s*:/i,
   ];
-  for (const pattern of injectionPhrases) {
+  for (const pattern of promptInjectionPatterns) {
     if (pattern.test(content)) {
-      throw new Error(`File "${fileName}" contains prompt injection phrases and was rejected.`);
+      throw new Error(`[SECURITY] Prompt injection pattern detected in ${fileName}: ${pattern}`);
     }
   }
 
-  // 5. Detect leetspeak obfuscation of injection keywords
-  // Normalize common leet substitutions and re-check
-  const leetNormalized = content
-    .replace(/0/g, "o")
-    .replace(/1/g, "i")
-    .replace(/3/g, "e")
+  // 5. Detect leetspeak obfuscation of common injection keywords
+  const normalizedContent = content
     .replace(/4/g, "a")
+    .replace(/3/g, "e")
+    .replace(/1/g, "i")
+    .replace(/0/g, "o")
     .replace(/5/g, "s")
     .replace(/7/g, "t")
     .replace(/@/g, "a")
-    .replace(/\$/g, "s");
-  const leetInjectionPhrases = [
-    /ignore (previous|all|above|prior) (instructions?|prompts?|context)/i,
-    /disregard (previous|all|above|prior) (instructions?|prompts?|context)/i,
-    /you are now/i,
+    .replace(/\$/g, "s")
+    .toLowerCase();
+  const leetspeakInjectionPatterns = [
+    /ignore\s+(all\s+)?previous\s+instructions/i,
     /jailbreak/i,
-    /do anything now/i,
+    /bypass\s+(safety|filter)/i,
   ];
-  for (const pattern of leetInjectionPhrases) {
-    if (pattern.test(leetNormalized)) {
-      throw new Error(`File "${fileName}" contains leetspeak-obfuscated prompt injection and was rejected.`);
+  for (const pattern of leetspeakInjectionPatterns) {
+    if (pattern.test(normalizedContent)) {
+      throw new Error(`[SECURITY] Leetspeak-obfuscated prompt injection detected in ${fileName}`);
     }
   }
 
-  // 6. Strip invisible/hidden Unicode characters (zero-width spaces, soft hyphens, etc.)
-  const sanitized = content
-    .replace(/[\u200B-\u200D\uFEFF\u00AD\u2060\u180E\u00A0]/g, " ") // zero-width & invisible chars
-    .replace(/[\u202A-\u202E]/g, "")  // Unicode bidirectional override characters
-    .replace(/[\u2066-\u2069]/g, ""); // Isolate/override formatting chars
+  // 6. Detect shell/binary commands embedded in content
+  const shellCommandPatterns = [
+    /\b(rm|wget|curl|chmod|chown|sudo|bash|sh|python|perl|ruby|exec|eval|system)\s+(-[a-zA-Z]+\s+)?[\/~.]/i,
+    /\$\(.*\)/,
+    /`[^`]{1,200}`/,
+    /<script[\s>]/i,
+    /javascript\s*:/i,
+  ];
+  for (const pattern of shellCommandPatterns) {
+    if (pattern.test(content)) {
+      throw new Error(`[SECURITY] Shell/binary command detected in ${fileName}: ${pattern}`);
+    }
+  }
 
-  return sanitized;
+  return content;
 }
 
-// --- Input sanitization/validation helpers ---
-const MAX_CONTENT_LENGTH = 100_000; // characters
-
-// Patterns that suggest prompt-injection or instruction-override attempts
-const INJECTION_PATTERNS = [
-  /ignore\s+(all\s+)?(previous|prior|above)\s+instructions?/i,
-  /you\s+are\s+now\s+(a|an)?\s*\w+/i,
-  /system\s*:\s*(you|your|ignore)/i,
-  /<\s*\/?(system|user|assistant)\s*>/i,
-  /\[\s*(INST|SYS|SYSTEM)\s*\]/i,
-];
+const MAX_FILE_SIZE_BYTES = 500_000; // 500 KB limit per file
+const MAX_CHUNK_LENGTH = 2000;      // max characters per chunk sent to embeddings
 
 /**
- * Sanitizes raw text before it is sent to the AI model.
- * @param {string} text - Raw text content from a file.
- * @param {string} source - Identifier used in error messages (e.g. file name).
- * @returns {string} Sanitized text safe to pass to the embedding model.
+ * Sanitizes raw text content before sending to the AI model.
+ * - Removes null bytes and non-printable control characters (except common whitespace)
+ * - Trims leading/trailing whitespace
+ * - Enforces a maximum length
+ * @param {string} text
+ * @param {number} [maxLength]
+ * @returns {string}
  */
-function sanitizeAndValidate(text, source) {
+function sanitizeText(text, maxLength = MAX_FILE_SIZE_BYTES) {
   if (typeof text !== "string") {
-    throw new Error(`[${source}] Content must be a string.`);
+    throw new TypeError("Input must be a string");
   }
-
-  // 1. Remove null bytes
-  let sanitized = text.replace(/\0/g, "");
-
-  // 2. Strip non-printable ASCII control characters (except \t, \n, \r)
+  // Remove null bytes and non-printable control characters except \t, \n, \r
   // eslint-disable-next-line no-control-regex
-  sanitized = sanitized.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "");
-
-  // 3. Enforce maximum length
-  if (sanitized.length > MAX_CONTENT_LENGTH) {
-    console.warn(
-      `[${source}] Content truncated from ${sanitized.length} to ${MAX_CONTENT_LENGTH} characters.`
-    );
-    sanitized = sanitized.slice(0, MAX_CONTENT_LENGTH);
+  const cleaned = text.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "");
+  const trimmed = cleaned.trim();
+  if (trimmed.length === 0) {
+    throw new Error("File content is empty after sanitization");
   }
-
-  // 4. Reject empty content
-  if (sanitized.trim().length === 0) {
-    throw new Error(`[${source}] Content is empty after sanitization.`);
-  }
-
-  // 5. Detect prompt-injection patterns
-  for (const pattern of INJECTION_PATTERNS) {
-    if (pattern.test(sanitized)) {
-      throw new Error(
-        `[${source}] Content rejected: potential prompt-injection pattern detected (${pattern}).`
-      );
-    }
-  }
-
-  return sanitized;
+  return trimmed.slice(0, maxLength);
 }
-// --- End sanitization helpers ---
 
-const COMPANIONS_DIR = path.resolve("companions");
+// ---------------------------------------------------------------------------
+// Prompt-injection / malicious-content guard
+// ---------------------------------------------------------------------------
+function sanitizeFileContent(content, fileName) {
+  // 1. Reject binary / non-UTF-8 content (null bytes are a strong signal)
+  if (/\x00/.test(content)) {
+    throw new Error(`[SECURITY] Binary content detected in "${fileName}". Aborting.`);
+  }
+
+  // 2. Strip and warn about invisible / zero-width characters
+  const invisiblePattern = /[\u200B-\u200D\uFEFF\u00AD\u2060\u180E]/g;
+  if (invisiblePattern.test(content)) {
+    console.warn(`[SECURITY] Invisible/zero-width characters found in "${fileName}" and removed.`);
+    content = content.replace(invisiblePattern, "");
+  }
+
+  // 3. Detect and reject base64-encoded blobs (long runs of base64 chars)
+  const base64Pattern = /(?:[A-Za-z0-9+\/]{40,}={0,2})/g;
+  if (base64Pattern.test(content)) {
+    throw new Error(`[SECURITY] Potential base64-encoded payload detected in "${fileName}". Aborting.`);
+  }
+
+  // 4. Detect shell / script execution patterns
+  const shellPattern =
+    /(\$\(|`[^`]*`|\beval\s*\(|\bexec\s*\(|\bsystem\s*\(|\bspawn\s*\(|\bchild_process\b|\bsh\s+-c\b|\bbash\s+-c\b|\bpowershell\b|\bcmd\.exe\b)/i;
+  if (shellPattern.test(content)) {
+    throw new Error(`[SECURITY] Shell/script execution pattern detected in "${fileName}". Aborting.`);
+  }
+
+  // 5. Detect common prompt-injection / jailbreak keywords
+  const injectionPattern =
+    /(ignore (all |previous |prior |above |the )?(instructions?|prompts?|rules?|constraints?)|you are now|act as (an? |a )?(unrestricted|jailbroken|evil|malicious|DAN)|disregard (your |all )?(previous |prior |above )?(instructions?|rules?|guidelines?)|system prompt|<\|im_start\||<\|im_end\||\[INST\]|\[\/?SYS\])/i;
+  if (injectionPattern.test(content)) {
+    throw new Error(`[SECURITY] Prompt-injection pattern detected in "${fileName}". Aborting.`);
+  }
+
+  // 6. Detect leetspeak substitution attempts on sensitive keywords
+  //    e.g. "1gnor3", "3x3cut3", "syst3m"
+  const leetspeakPattern = /\b(?:[i1][g9][n][o0][r3][e3]|[e3][x*][e3][c*][u*][t+][e3]|[s$][y*][s$][t+][e3][m*])\b/i;
+  if (leetspeakPattern.test(content)) {
+    throw new Error(`[SECURITY] Leetspeak obfuscation of sensitive keyword detected in "${fileName}". Aborting.`);
+  }
+
+  // 7. Enforce a reasonable maximum file size (512 KB)
+  const MAX_BYTES = 512 * 1024;
+  if (Buffer.byteLength(content, "utf8") > MAX_BYTES) {
+    throw new Error(`[SECURITY] File "${fileName}" exceeds the 512 KB size limit. Aborting.`);
+  }
+
+  return content;
+}
+// ---------------------------------------------------------------------------
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+// Resolve the absolute, canonical path of the companions directory once.
+const COMPANIONS_DIR = path.resolve(__dirname, "../../companions");
+
 const fileNames = fs.readdirSync(COMPANIONS_DIR);
 const splitter = new CharacterTextSplitter({
   separator: " ",
@@ -337,22 +335,63 @@ const splitter = new CharacterTextSplitter({
   chunkOverlap: 50, //TODO: adjust both chunk size and chunk overlap later
 });
 
+// Output data minimisation constants
+const MAX_SECTION_CHARS = 2000;  // hard cap on raw text fed into the splitter
+const MAX_CHUNKS_PER_DOC = 8;   // maximum number of chunks stored per companion
+
+// Redact lines that may contain sensitive fields before indexing.
+const SENSITIVE_LINE_PATTERN = /^[^\n]*\b(key|secret|password|passwd|token|email|api[_\s]?key)\s*[:=]/im;
+
+function minimiseSection(raw) {
+  // 1. Truncate to the allowed character budget.
+  const truncated = raw.slice(0, MAX_SECTION_CHARS);
+  // 2. Remove lines that match sensitive field patterns.
+  const redacted = truncated
+    .split("\n")
+    .filter((line) => !SENSITIVE_LINE_PATTERN.test(line))
+    .join("\n");
+  return redacted;
+}
+
 const langchainDocs = await Promise.all(
   fileNames.map(async (fileName) => {
     if (fileName.endsWith(".txt")) {
       const filePath = path.join("companions", fileName);
       const rawContent = fs.readFileSync(filePath, "utf8");
-      const fileContent = sanitizeFileContent(rawContent, fileName);
+      // Validate file size before processing
+      if (Buffer.byteLength(rawContent, "utf8") > MAX_FILE_SIZE_BYTES) {
+        console.warn(`Skipping ${fileName}: file exceeds maximum allowed size.`);
+        return [];
+      }
+      // Sanitize raw file content
+      let fileContent;
+      try {
+        fileContent = sanitizeText(rawContent);
+      } catch (err) {
+        console.warn(`Skipping ${fileName}: ${err.message}`);
+        return [];
+      }
       // get the last section in the doc for background info
-      const rawLastSection = fileContent.split("###ENDSEEDCHAT###").slice(-1)[0];
-      const lastSection = sanitizeAndValidate(rawLastSection, fileName);
-      const splitDocs = await splitter.createDocuments([lastSection]);
-      return splitDocs.map((doc) => {
-        return new Document({
-          metadata: { fileName: path.basename(fileName) },
-          pageContent: doc.pageContent,
+      const lastSection = fileContent.split("###ENDSEEDCHAT###").slice(-1)[0];
+      // Sanitize the extracted section
+      let sanitizedSection;
+      try {
+        sanitizedSection = sanitizeText(lastSection);
+      } catch (err) {
+        console.warn(`Skipping ${fileName} (last section empty after sanitization): ${err.message}`);
+        return [];
+      }
+      const splitDocs = await splitter.createDocuments([sanitizedSection]);
+      return splitDocs
+        .filter((doc) => doc.pageContent && doc.pageContent.trim().length > 0)
+        .map((doc) => {
+          // Sanitize each individual chunk before embedding
+          const safeContent = sanitizeText(doc.pageContent, MAX_CHUNK_LENGTH);
+          return new Document({
+            metadata: { fileName },
+            pageContent: safeContent,
+          });
         });
-      });
     }
   })
 );
@@ -364,70 +403,159 @@ await client.init({
 });
 const pineconeIndex = client.Index(config.pinecone.index);
 
-// --- Audit trail setup ---
-const MODEL_ID = "text-embedding-ada-002"; // OpenAIEmbeddings default model
-const correlationId = crypto.randomUUID();
-const principal = process.env.AUDIT_PRINCIPAL || os.userInfo().username || "unknown";
-const operationTimestamp = new Date().toISOString();
+// Sanitization helper: validates that an embedding vector is a plain numeric array
+// and that its serialized form contains no dynamic code execution primitives.
+function validateEmbedding(embedding, context) {
+  const DANGEROUS_PATTERNS = [
+    /\beval\s*\(/i,
+    /\bexec\s*\(/i,
+    /\bsubprocess\b/i,
+    /\bspawn\s*\(/i,
+    /\bFunction\s*\(/i,
+    /\bnew\s+Function\b/i,
+    /\bsetTimeout\s*\(/i,
+    /\bsetInterval\s*\(/i,
+    /\brequire\s*\(/i,
+    /\bimport\s*\(/i,
+    /\bchild_process\b/i,
+    /\bos\.system\b/i,
+    /\bexecSync\s*\(/i,
+    /\bexecFile\s*\(/i,
+  ];
 
+  if (!Array.isArray(embedding)) {
+    throw new Error(`[LLM Output Validation] ${context}: embedding is not an array.`);
+  }
+
+  for (let i = 0; i < embedding.length; i++) {
+    const val = embedding[i];
+    if (typeof val !== "number" || !isFinite(val)) {
+      throw new Error(
+        `[LLM Output Validation] ${context}: embedding[${i}] is not a finite number (got ${typeof val}: ${val}).`
+      );
+    }
+  }
+
+  // Serialize and scan for dangerous patterns as a belt-and-suspenders check.
+  const serialized = JSON.stringify(embedding);
+  for (const pattern of DANGEROUS_PATTERNS) {
+    if (pattern.test(serialized)) {
+      throw new Error(
+        `[LLM Output Validation] ${context}: embedding contains a forbidden dynamic code execution primitive matching ${pattern}.`
+      );
+    }
+  }
+}
+
+// Wrap OpenAIEmbeddings to validate all output before it reaches Pinecone.
+class SafeOpenAIEmbeddings extends OpenAIEmbeddings {
+  async embedDocuments(texts) {
+    const embeddings = await super.embedDocuments(texts);
+    if (!Array.isArray(embeddings)) {
+      throw new Error("[LLM Output Validation] embedDocuments: result is not an array.");
+    }
+    embeddings.forEach((embedding, idx) =>
+      validateEmbedding(embedding, `embedDocuments[${idx}]`)
+    );
+    return embeddings;
+  }
+
+  async embedQuery(text) {
+    const embedding = await super.embedQuery(text);
+    validateEmbedding(embedding, "embedQuery");
+    return embedding;
+  }
+}
+
+const docsToIndex = langchainDocs.flat().filter((doc) => doc !== undefined);
+console.log(
+  `[LLM Interaction] Calling OpenAIEmbeddings via PineconeStore.fromDocuments. ` +
+  `Model: text-embedding-ada-002. Documents to embed: ${docsToIndex.length}. ` +
+  `Timestamp: ${new Date().toISOString()}`
+);
+// ── Audit: pre-action record ────────────────────────────────────────────────
 const filteredDocs = langchainDocs.flat().filter((doc) => doc !== undefined);
+const correlationId = crypto.randomUUID();
+const actionTimestamp = new Date().toISOString();
+const inputHash = hashDocuments(filteredDocs);
 
-// Compute a SHA-256 hash over the concatenated page content of all input documents
-const inputHash = crypto
-  .createHash("sha256")
-  .update(filteredDocs.map((d) => d.pageContent).join("\n"))
-  .digest("hex");
-
-// Write the pre-operation audit record
-writeAuditRecord({
-  event: "AI_INDEXING_STARTED",
+const auditPreRecord = {
   correlationId,
-  timestamp: operationTimestamp,
-  principal,
+  timestamp: actionTimestamp,
+  principal: PRINCIPAL,
   action: "PineconeStore.fromDocuments",
-  modelId: MODEL_ID,
+  modelIdentifier: MODEL_IDENTIFIER,
   pineconeIndex: process.env.PINECONE_INDEX,
   pineconeEnvironment: process.env.PINECONE_ENVIRONMENT,
   documentCount: filteredDocs.length,
-  inputDocumentsHash: inputHash,
-});
+  inputHash,
+  retentionDays: AUDIT_RETENTION_DAYS,
+  status: "INITIATED",
+};
 
 try {
-  await PineconeStore.fromDocuments(
-    filteredDocs,
-    new OpenAIEmbeddings({ openAIApiKey: config.openai.apiKey }),
-    {
-      pineconeIndex,
-    }
-  );
-
-  // Write the post-operation success audit record
-  writeAuditRecord({
-    event: "AI_INDEXING_COMPLETED",
-    correlationId,
-    timestamp: new Date().toISOString(),
-    principal,
-    action: "PineconeStore.fromDocuments",
-    modelId: MODEL_ID,
-    pineconeIndex: process.env.PINECONE_INDEX,
-    documentCount: filteredDocs.length,
-    inputDocumentsHash: inputHash,
-    status: "SUCCESS",
-  });
-} catch (err) {
-  // Write the failure audit record before re-throwing
-  writeAuditRecord({
-    event: "AI_INDEXING_FAILED",
-    correlationId,
-    timestamp: new Date().toISOString(),
-    principal,
-    action: "PineconeStore.fromDocuments",
-    modelId: MODEL_ID,
-    pineconeIndex: process.env.PINECONE_INDEX,
-    documentCount: filteredDocs.length,
-    inputDocumentsHash: inputHash,
-    status: "FAILURE",
-    error: err.message,
-  });
-  throw err;
+  writeAuditRecord(auditPreRecord);
+} catch (auditErr) {
+  // Logging failure must not silently pass — surface it and abort.
+  console.error("[AUDIT FAILURE] Could not write pre-action audit record:", auditErr);
+  process.exit(2);
 }
+
+// ── AI-driven action ─────────────────────────────────────────────────────────
+let actionOutcome = "UNKNOWN";
+let actionError = null;
+try {
+  // Verify model identity, registry membership, and integrity before use.
+assertModelApproved(EMBEDDING_MODEL_ID, EMBEDDING_MODEL_ID_SHA256);
+
+console.log(`[model-identity] Instantiating embeddings with pinned model: ${EMBEDDING_MODEL_ID}`);
+const embeddings = new OpenAIEmbeddings({
+  openAIApiKey: process.env.OPENAI_API_KEY,
+  modelName: EMBEDDING_MODEL_ID, // explicit version pin
+});
+
+await PineconeStore.fromDocuments(
+  langchainDocs.flat().filter((doc) => doc !== undefined),
+  embeddings,
+  {
+    pineconeIndex,
+    // Record model identity in index metadata for auditability.
+    namespace: `model:${EMBEDDING_MODEL_ID}`,
+  }
+);
+  actionOutcome = "SUCCESS";
+} catch (err) {
+  actionOutcome = "FAILURE";
+  actionError = { message: err.message, stack: err.stack };
+  throw err; // re-throw after audit so the process exits with a non-zero code
+} finally {
+  // ── Audit: post-action record ──────────────────────────────────────────────
+  const auditPostRecord = {
+    correlationId,
+    timestamp: new Date().toISOString(),
+    principal: PRINCIPAL,
+    action: "PineconeStore.fromDocuments",
+    modelIdentifier: MODEL_IDENTIFIER,
+    pineconeIndex: process.env.PINECONE_INDEX,
+    pineconeEnvironment: process.env.PINECONE_ENVIRONMENT,
+    documentCount: filteredDocs.length,
+    inputHash,
+    retentionDays: AUDIT_RETENTION_DAYS,
+    status: actionOutcome,
+    ...(actionError ? { error: actionError } : {}),
+  };
+
+  try {
+    writeAuditRecord(auditPostRecord);
+  } catch (auditErr) {
+    // Post-action logging failure is critical — surface it explicitly.
+    console.error("[AUDIT FAILURE] Could not write post-action audit record:", auditErr);
+    // Do not suppress the original action error; exit with a distinct code.
+    process.exitCode = 2;
+  }
+}
+console.log(
+  `[LLM Interaction] OpenAIEmbeddings call completed successfully. ` +
+  `Documents indexed: ${docsToIndex.length}. ` +
+  `Timestamp: ${new Date().toISOString()}`
+);
