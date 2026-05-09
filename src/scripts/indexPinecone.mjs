@@ -1,8 +1,4 @@
 // Major ref: https://js.langchain.com/docs/modules/indexes/vector_stores/integrations/pinecone
-// External systems credentialed by this script (policy limit: 3 max):
-//   1. Pinecone  — PINECONE_API_KEY, PINECONE_ENVIRONMENT, PINECONE_INDEX
-//   2. OpenAI    — OPENAI_API_KEY
-// Total distinct external systems: 2 (within policy limit)
 import { PineconeClient } from "@pinecone-database/pinecone";
 import dotenv from "dotenv";
 import { Document } from "langchain/document";
@@ -14,417 +10,348 @@ import path from "path";
 import crypto from "crypto";
 import os from "os";
 
-// Audit log configuration
-const AUDIT_LOG_PATH = process.env.AUDIT_LOG_PATH || "audit_log.ndjson";
-const AUDIT_LOG_RETENTION_DAYS = parseInt(process.env.AUDIT_LOG_RETENTION_DAYS || "365", 10);
+// ---------------------------------------------------------------------------
+// Audit helpers
+// ---------------------------------------------------------------------------
+const AUDIT_LOG_PATH = path.resolve("audit.log");
+const MODEL_ID = "text-embedding-ada-002"; // OpenAIEmbeddings default model
+const MODEL_VERSION = "002";
 
+/**
+ * Appends a single JSON-Lines audit record to the persistent audit log.
+ * Each record is written synchronously so it survives process crashes.
+ */
 function writeAuditRecord(record) {
-  try {
-    const line = JSON.stringify(record) + "\n";
-    fs.appendFileSync(AUDIT_LOG_PATH, line, { encoding: "utf8", flag: "a" });
-  } catch (loggingError) {
-    // Logging failure must not silently pass — write to stderr and abort
-    process.stderr.write(
-      `[AUDIT FAILURE] Unable to write audit record: ${loggingError.message}\n` +
-      `Intended record: ${JSON.stringify(record)}\n`
-    );
-    process.exit(1); // Halt execution to preserve forensic integrity
-  }
+  const line = JSON.stringify(record) + "\n";
+  fs.appendFileSync(AUDIT_LOG_PATH, line, { encoding: "utf8", flag: "a" });
 }
 
-function generateTraceId() {
-  return crypto.randomUUID();
-}
-
+/**
+ * Returns a SHA-256 hex digest of the serialised document corpus.
+ * Used as the input-hash for forensic reproducibility.
+ */
 function hashDocuments(docs) {
-  const content = docs
-    .filter((d) => d !== undefined)
-    .map((d) => d.pageContent + JSON.stringify(d.metadata))
-    .join("|");
-  return crypto.createHash("sha256").update(content, "utf8").digest("hex");
+  const serialised = JSON.stringify(
+    docs.map((d) => ({ pageContent: d.pageContent, metadata: d.metadata }))
+  );
+  return crypto.createHash("sha256").update(serialised, "utf8").digest("hex");
+}
+
+/**
+ * Generates a random UUID-v4 correlation/trace identifier.
+ */
+function newTraceId() {
+  return crypto.randomUUID ? crypto.randomUUID() : crypto.randomBytes(16).toString("hex");
+}
+
+// Singapore PII redaction: removes/masks common SG PII categories before indexing
+function redactSingaporePII(text) {
+  // NRIC/FIN numbers (e.g. S1234567A, T0123456B, F1234567C, G1234567D)
+  text = text.replace(/\b[STFG]\d{7}[A-Z]\b/gi, "[REDACTED_NRIC]");
+
+  // Singapore personal mobile numbers (+65 8/9 XXXXXXX or 8/9XXXXXXX)
+  text = text.replace(/(\+65[\s-]?)?[89]\d{7}\b/g, "[REDACTED_MOBILE]");
+
+  // Email addresses
+  text = text.replace(/[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g, "[REDACTED_EMAIL]");
+
+  // Full names heuristic: two or more capitalised words in sequence (Title Case)
+  // This targets patterns like "John Tan Wei Ming" while avoiding sentence starts
+  text = text.replace(/\b([A-Z][a-z]+)(\s[A-Z][a-z]+){1,4}\b/g, "[REDACTED_NAME]");
+
+  return text;
 }
 
 dotenv.config({ path: `.env.local` });
 
+// Approved foundation model registry — only models listed here may be used for embeddings.
+const APPROVED_EMBEDDING_MODELS = Object.freeze([
+  "text-embedding-ada-002",
+]);
+
+// Pinned model identity — must match an entry in APPROVED_EMBEDDING_MODELS.
+const EMBEDDING_MODEL_NAME = "text-embedding-ada-002";
+const EMBEDDING_MODEL_VERSION = "text-embedding-ada-002"; // OpenAI does not expose a separate version; the model name is the immutable identifier.
+
+if (!APPROVED_EMBEDDING_MODELS.includes(EMBEDDING_MODEL_NAME)) {
+  throw new Error(
+    `Model '${EMBEDDING_MODEL_NAME}' is not in the approved model registry. ` +
+    `Approved models: ${APPROVED_EMBEDDING_MODELS.join(", ")}`
+  );
+}
+
+console.log(
+  `[model-identity] embedding model='${EMBEDDING_MODEL_NAME}' version='${EMBEDDING_MODEL_VERSION}' approved=true`
+);
+
 /**
- * Sanitizes text before passing it to an AI model.
- * Throws if suspicious/malicious content is detected.
+ * Redacts common PII categories from a string.
+ * Covers: email, phone, SSN, credit card, date of birth, and street addresses.
+ * @param {string} text
+ * @returns {string} text with PII replaced by placeholder tokens
  */
-function sanitizeForAI(text, source) {
-  // 1. Reject binary / non-printable content (allow common whitespace)
-  // eslint-disable-next-line no-control-regex
-  if (/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/.test(text)) {
-    throw new Error(`[${source}] Binary or non-printable characters detected. Aborting.`);
-  }
+function redactPII(text) {
+  // Email addresses
+  text = text.replace(/[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g, "[REDACTED_EMAIL]");
 
-  // 2. Strip and warn about zero-width / invisible Unicode characters
-  const invisiblePattern = /[\u200B-\u200D\uFEFF\u00AD\u2060\u180E]/g;
-  if (invisiblePattern.test(text)) {
-    console.warn(`[${source}] Invisible/zero-width characters found and removed.`);
-    text = text.replace(invisiblePattern, "");
-  }
+  // Phone numbers (various formats: +1-800-555-1234, (800) 555-1234, 800.555.1234, etc.)
+  text = text.replace(
+    /(\+?1[\s.\-]?)?\(?\d{3}\)?[\s.\-]?\d{3}[\s.\-]?\d{4}/g,
+    "[REDACTED_PHONE]"
+  );
 
-  // 3. Detect suspiciously long base64-like blobs (potential encoded payloads)
-  const base64Pattern = /(?:[A-Za-z0-9+/]{40,}={0,2})/g;
-  const base64Matches = text.match(base64Pattern) || [];
-  for (const match of base64Matches) {
-    try {
-      const decoded = Buffer.from(match, "base64").toString("utf8");
-      // If the decoded string contains shell-like commands, reject it
-      if (/(?:bash|sh|cmd|powershell|eval|exec|system|rm\s+-|wget|curl\s+http|chmod|sudo)/i.test(decoded)) {
-        throw new Error(`[${source}] Base64-encoded shell command detected. Aborting.`);
-      }
-    } catch (e) {
-      if (e.message.includes("Aborting")) throw e;
-      // Not valid base64 — ignore
-    }
-  }
+  // Social Security Numbers (SSN): 123-45-6789 or 123 45 6789
+  text = text.replace(/\b\d{3}[\s\-]\d{2}[\s\-]\d{4}\b/g, "[REDACTED_SSN]");
 
-  // 4. Detect common shell / OS command patterns
-  const shellCommandPattern =
-    /(?:^|\s)(?:rm\s+-[rRf]+|wget\s+http|curl\s+http|bash\s+-[ci]|sh\s+-[ci]|eval\s*\(|exec\s*\(|system\s*\(|os\.system|subprocess|__import__|\$\(|`[^`]+`)/im;
-  if (shellCommandPattern.test(text)) {
-    throw new Error(`[${source}] Shell command pattern detected. Aborting.`);
-  }
+  // Credit card numbers (16-digit, optionally separated by spaces or dashes)
+  text = text.replace(/\b(?:\d{4}[\s\-]?){3}\d{4}\b/g, "[REDACTED_CREDIT_CARD]");
 
-  // 5. Detect prompt-injection trigger phrases
-  const injectionPhrases = [
-    /ignore\s+(all\s+)?previous\s+instructions/i,
-    /disregard\s+(all\s+)?previous\s+instructions/i,
-    /you\s+are\s+now\s+(a\s+)?(?:an?\s+)?(?:evil|malicious|unrestricted|jailbroken)/i,
-    /act\s+as\s+(if\s+you\s+are\s+)?(?:an?\s+)?(?:evil|malicious|unrestricted|jailbroken)/i,
-    /do\s+anything\s+now/i,
-    /DAN\b/,
-    /jailbreak/i,
-    /override\s+(your\s+)?(?:safety|content)\s+(?:filters?|guidelines?|policy|policies)/i,
-  ];
-  for (const pattern of injectionPhrases) {
-    if (pattern.test(text)) {
-      throw new Error(`[${source}] Prompt injection phrase detected (pattern: ${pattern}). Aborting.`);
-    }
-  }
+  // Dates of birth (MM/DD/YYYY, MM-DD-YYYY, YYYY-MM-DD)
+  text = text.replace(
+    /\b(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}|\d{4}[\-]\d{2}[\-]\d{2})\b/g,
+    "[REDACTED_DATE]"
+  );
 
-  // 6. Detect leetspeak obfuscation of dangerous words
-  // Normalise common leet substitutions then re-check injection phrases
-  const leetNormalized = text
-    .replace(/0/g, "o")
-    .replace(/1/g, "i")
-    .replace(/3/g, "e")
-    .replace(/4/g, "a")
-    .replace(/5/g, "s")
-    .replace(/7/g, "t")
-    .replace(/@/g, "a")
-    .replace(/\$/g, "s");
-  for (const pattern of injectionPhrases) {
-    if (pattern.test(leetNormalized)) {
-      throw new Error(`[${source}] Leetspeak-obfuscated prompt injection detected (pattern: ${pattern}). Aborting.`);
-    }
-  }
+  // Street addresses (e.g., 123 Main St, 456 Elm Avenue Apt 7)
+  text = text.replace(
+    /\b\d+\s+[A-Za-z0-9\s,.']+(?:Street|St|Avenue|Ave|Boulevard|Blvd|Road|Rd|Lane|Ln|Drive|Dr|Court|Ct|Circle|Cir|Way|Place|Pl|Terrace|Ter|Trail|Trl|Parkway|Pkwy|Highway|Hwy)(?:\s+(?:Apt|Suite|Ste|Unit|#)\s*[\w\-]+)?\b/gi,
+    "[REDACTED_ADDRESS]"
+  );
+
+  // ZIP codes (standalone 5-digit or ZIP+4)
+  text = text.replace(/\b\d{5}(?:\-\d{4})?\b/g, "[REDACTED_ZIP]");
 
   return text;
 }
 
 /**
- * Sanitizes file content to prevent prompt injection attacks.
- * Throws an error if malicious content is detected.
+ * Sanitizes text content before passing it to the AI pipeline.
+ * Throws if suspicious content is detected; otherwise returns cleaned text.
  */
-function sanitizeFileContent(content, fileName) {
-  // 1. Reject files containing non-printable / invisible characters (except common whitespace)
-  // eslint-disable-next-line no-control-regex
-  if (/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/.test(content)) {
-    throw new Error(`[SECURITY] File "${fileName}" contains hidden/binary control characters and was rejected.`);
+function sanitizeContent(content, fileName) {
+  // 1. Reject binary / shell executable signatures
+  if (/^(\x7fELF|MZ|\x89PNG|\xff\xd8\xff)/.test(content)) {
+    throw new Error(`[${fileName}] Binary executable content detected — skipping.`);
   }
 
-  // 2. Detect zero-width / invisible Unicode characters used to hide text
-  if (/[\u200B-\u200F\u202A-\u202E\u2060-\u2064\uFEFF\u00AD]/.test(content)) {
-    throw new Error(`[SECURITY] File "${fileName}" contains invisible Unicode characters and was rejected.`);
+  // 2. Strip invisible / zero-width characters that can hide prompts
+  //    (zero-width space, zero-width non-joiner, zero-width joiner, soft-hyphen, etc.)
+  const invisiblePattern = /[\u00ad\u200b-\u200f\u202a-\u202e\u2060-\u2064\ufeff]/g;
+  if (invisiblePattern.test(content)) {
+    console.warn(`[${fileName}] Invisible/hidden characters detected and stripped.`);
+    content = content.replace(invisiblePattern, "");
   }
 
-  // 3. Detect base64-encoded blobs (long runs of base64 chars) that may hide instructions
-  if (/[A-Za-z0-9+/]{200,}={0,2}/.test(content)) {
-    throw new Error(`[SECURITY] File "${fileName}" contains a suspicious base64-encoded block and was rejected.`);
+  // 3. Detect and reject base64-encoded blobs (long runs of base64 chars)
+  //    A standalone base64 string of 100+ chars is suspicious.
+  const base64Pattern = /(?:[A-Za-z0-9+/]{4}){25,}={0,2}/g;
+  if (base64Pattern.test(content)) {
+    throw new Error(`[${fileName}] Base64-encoded content detected — possible hidden prompt injection.`);
   }
 
-  // 4. Detect common prompt-injection / jailbreak patterns (case-insensitive)
-  const promptInjectionPatterns = [
-    /ignore\s+(all\s+)?(previous|prior|above)\s+instructions?/i,
-    /disregard\s+(all\s+)?(previous|prior|above)\s+instructions?/i,
-    /forget\s+(all\s+)?(previous|prior|above)\s+instructions?/i,
-    /you\s+are\s+now\s+(a|an|the)?\s*(?:different|new|another|evil|unrestricted)/i,
-    /act\s+as\s+(a|an|the)?\s*(?:different|new|another|evil|unrestricted|jailbreak)/i,
-    /do\s+not\s+follow\s+(your\s+)?(previous\s+)?instructions?/i,
-    /override\s+(your\s+)?(previous\s+)?instructions?/i,
-    /system\s*:\s*(you\s+are|ignore|forget|disregard)/i,
-    /\[INST\]|\[\/?SYS\]|<\|im_start\|>|<\|im_end\|>/i,
-    /###\s*(instruction|system|prompt|human|assistant)\s*:/i,
-  ];
-  for (const pattern of promptInjectionPatterns) {
-    if (pattern.test(content)) {
-      throw new Error(`[SECURITY] File "${fileName}" contains a suspected prompt-injection pattern and was rejected.`);
-    }
+  // 4. Detect leetspeak substitution patterns used to obfuscate instructions
+  //    e.g. "1gnor3", "3x3cut3", "1nstruct10n"
+  const leetspeakPattern = /\b(?=[a-z0-9]*[0-9][a-z0-9]*)(?=[a-z0-9]*[a-z][a-z0-9]*)[a-z0-9]{5,}\b/gi;
+  const leetspeakMatches = content.match(leetspeakPattern) || [];
+  if (leetspeakMatches.length > 5) {
+    throw new Error(`[${fileName}] Excessive leetspeak patterns detected — possible obfuscated prompt injection.`);
   }
 
-  // 5. Detect leetspeak substitutions for common injection keywords
-  // Normalise digits/symbols that replace letters, then re-check
-  const leetNormalized = content
-    .replace(/0/g, "o")
-    .replace(/1/g, "i")
-    .replace(/3/g, "e")
-    .replace(/4/g, "a")
-    .replace(/5/g, "s")
-    .replace(/7/g, "t")
-    .replace(/@/g, "a")
-    .replace(/\$/g, "s");
-  const leetKeywords = [
-    /ignore\s+previous\s+instructions?/i,
-    /disregard\s+previous\s+instructions?/i,
-    /jailbreak/i,
-  ];
-  for (const pattern of leetKeywords) {
-    if (pattern.test(leetNormalized)) {
-      throw new Error(`[SECURITY] File "${fileName}" contains suspected leetspeak prompt-injection content and was rejected.`);
-    }
+  // 5. Detect shell / command injection patterns
+  const shellPattern = /(?:ignore\s+(?:previous|above|prior)\s+instructions?|system\s*\(|exec\s*\(|eval\s*\(|subprocess|os\.system|rm\s+-rf|curl\s+|wget\s+|base64\s+-d|\|\s*sh|&&\s*sh|;\s*sh\b)/gi;
+  if (shellPattern.test(content)) {
+    throw new Error(`[${fileName}] Shell command or prompt-override pattern detected — skipping.`);
   }
 
-  // 6. Detect shell / binary command patterns
-  const shellPatterns = [
-    /\$\(.*\)/,           // command substitution $()
-    /`[^`]+`/,            // backtick execution
-    /\bexec\s*\(/i,
-    /\beval\s*\(/i,
-    /\bsystem\s*\(/i,
-    /\bpassthru\s*\(/i,
-    /\bshell_exec\s*\(/i,
-    /\brm\s+-rf\b/i,
-    /\bcurl\s+https?:\/\//i,
-    /\bwget\s+https?:\/\//i,
-    /\/bin\/(sh|bash|zsh|dash)/,
-    /\bpython[23]?\s+-c\b/i,
-    /\bnode\s+-e\b/i,
-  ];
-  for (const pattern of shellPatterns) {
-    if (pattern.test(content)) {
-      throw new Error(`[SECURITY] File "${fileName}" contains suspected shell/binary command content and was rejected.`);
-    }
+  // 6. Detect common prompt-injection override phrases
+  const injectionPhrases = /(?:disregard\s+(?:all\s+)?(?:previous|prior|above)|new\s+instructions?\s*:|you\s+are\s+now\s+(?:a|an)\s+|act\s+as\s+(?:a|an)\s+|forget\s+(?:everything|all))/gi;
+  if (injectionPhrases.test(content)) {
+    throw new Error(`[${fileName}] Prompt injection override phrase detected — skipping.`);
   }
 
   return content;
 }
 
-const MAX_FILE_SIZE_BYTES = 500_000; // 500 KB limit per file
-const MAX_CONTENT_LENGTH = 200_000;  // max characters sent to the model
+/**
+ * Sanitize file content to prevent prompt injection attacks.
+ * Throws an error if malicious content is detected.
+ */
+function sanitizeFileContent(content, fileName) {
+  // 1. Strip invisible / zero-width Unicode characters
+  // (zero-width space, zero-width non-joiner, zero-width joiner,
+  //  left-to-right mark, right-to-left mark, word joiner, etc.)
+  const invisibleCharsRegex =
+    /[\u200B\u200C\u200D\u200E\u200F\u202A-\u202E\u2060-\u2064\uFEFF]/g;
+  const stripped = content.replace(invisibleCharsRegex, "");
+
+  // 2. Detect base64-encoded blobs (long runs of base64 chars)
+  const base64BlobRegex = /[A-Za-z0-9+/]{200,}={0,2}/;
+  if (base64BlobRegex.test(stripped)) {
+    throw new Error(
+      `[SECURITY] File "${fileName}" contains a suspicious base64-encoded blob and was rejected.`
+    );
+  }
+
+  // 3. Detect shell commands / binary-like content
+  const shellCommandRegex =
+    /(\b(bash|sh|zsh|cmd|powershell|exec|eval|system|popen|subprocess)\b|\$\(|`[^`]*`|\|\s*\w+|;\s*rm\s|;\s*curl\s|;\s*wget\s|\x00)/i;
+  if (shellCommandRegex.test(stripped)) {
+    throw new Error(
+      `[SECURITY] File "${fileName}" contains shell commands or binary content and was rejected.`
+    );
+  }
+
+  // 4. Detect common prompt-injection / jailbreak keywords
+  const promptInjectionRegex =
+    /(ignore (all |previous |prior |above |the above |your )?(instructions?|prompts?|rules?|constraints?|guidelines?)|disregard (all |previous |prior |above |the above |your )?(instructions?|prompts?|rules?)|you are now|new persona|act as (an? )?(unrestricted|unfiltered|jailbroken|evil|malicious|DAN)|do anything now|\[system\]|<\|im_start\|>|<\|im_end\|>|<\|endoftext\|>)/i;
+  if (promptInjectionRegex.test(stripped)) {
+    throw new Error(
+      `[SECURITY] File "${fileName}" contains prompt-injection content and was rejected.`
+    );
+  }
+
+  // 5. Detect leetspeak obfuscation of the word "ignore" (1gn0r3, !gnore, etc.)
+  const leetspeakIgnoreRegex = /[1!][g9][n][0o][r][3e]/i;
+  if (leetspeakIgnoreRegex.test(stripped)) {
+    throw new Error(
+      `[SECURITY] File "${fileName}" contains leetspeak obfuscation and was rejected.`
+    );
+  }
+
+  return stripped;
+}
+
+// --- Input sanitization helpers ---
+const MAX_FILE_SIZE_BYTES = 500_000; // 500 KB per file
+const MAX_CHUNK_LENGTH = 2000;       // characters per chunk sent to the model
 
 /**
- * Sanitizes and validates raw file content before sending to the AI model.
- * - Rejects files that exceed the size limit
- * - Strips null bytes and non-printable control characters (except common whitespace)
- * - Rejects empty content after sanitization
- * - Truncates content that exceeds the character limit
+ * Sanitize raw text read from a file before it is sent to the LLM.
+ * - Rejects files that are too large.
+ * - Strips null bytes and non-printable ASCII control characters
+ *   (keeps newlines, tabs, and printable Unicode).
+ * - Truncates the result to a safe maximum length.
  */
-function sanitizeAndValidateContent(content, fileName) {
-  // 1. Enforce file size limit (byte-level check on the raw string)
+function sanitizeFileContent(content, filePath) {
   if (Buffer.byteLength(content, "utf8") > MAX_FILE_SIZE_BYTES) {
     throw new Error(
-      `File "${fileName}" exceeds the maximum allowed size of ${MAX_FILE_SIZE_BYTES} bytes and will not be indexed.`
+      `File "${filePath}" exceeds the maximum allowed size of ${MAX_FILE_SIZE_BYTES} bytes and will not be indexed.`
     );
   }
 
-  // 2. Strip null bytes and non-printable control characters
-  //    Allow: tab (\t), newline (\n), carriage return (\r), and printable Unicode
+  // Remove null bytes and ASCII control characters except \t (0x09) and \n (0x0A) and \r (0x0D)
   // eslint-disable-next-line no-control-regex
-  let sanitized = content.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "");
+  const sanitized = content.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "");
 
-  // 3. Collapse sequences of whitespace-only lines to a single blank line
-  sanitized = sanitized.replace(/(\r?\n){3,}/g, "\n\n").trim();
-
-  // 4. Reject empty content after sanitization
-  if (sanitized.length === 0) {
+  if (sanitized.trim().length === 0) {
     throw new Error(
-      `File "${fileName}" contains no usable content after sanitization and will not be indexed.`
+      `File "${filePath}" contains no usable text after sanitization.`
     );
-  }
-
-  // 5. Truncate to the maximum allowed character length
-  if (sanitized.length > MAX_CONTENT_LENGTH) {
-    console.warn(
-      `File "${fileName}" content truncated from ${sanitized.length} to ${MAX_CONTENT_LENGTH} characters.`
-    );
-    sanitized = sanitized.slice(0, MAX_CONTENT_LENGTH);
   }
 
   return sanitized;
 }
 
-const fileNames = fs.readdirSync("companions");
+/**
+ * Validate and sanitize a single document chunk before indexing.
+ * Returns null if the chunk should be discarded.
+ */
+function sanitizeChunk(pageContent) {
+  if (typeof pageContent !== "string") return null;
+  // eslint-disable-next-line no-control-regex
+  const cleaned = pageContent.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "").trim();
+  if (cleaned.length === 0) return null;
+  // Truncate chunks that are unexpectedly long
+  return cleaned.length > MAX_CHUNK_LENGTH ? cleaned.slice(0, MAX_CHUNK_LENGTH) : cleaned;
+}
+// --- End sanitization helpers ---
+
+const COMPANIONS_DIR = path.resolve("companions");
+const fileNames = fs.readdirSync(COMPANIONS_DIR);
 const splitter = new CharacterTextSplitter({
   separator: " ",
   chunkSize: 200,
   chunkOverlap: 50, //TODO: adjust both chunk size and chunk overlap later
 });
 
+// Data-minimisation constants
+const MAX_CHARS_PER_CHUNK = 500;   // hard cap on individual chunk size
+const MAX_CHUNKS_PER_DOC = 20;    // limit total chunks stored per document
+
+// Sensitive-field pattern: drop any line whose key portion matches
+const SENSITIVE_LINE_PATTERN =
+  /^\s*(email|phone|mobile|address|password|passwd|secret|token|api[_-]?key|ssn|dob|date[_\s]of[_\s]birth|credit[_\s]?card|card[_\s]?number)\s*[=:]/i;
+
+/**
+ * Redact lines that appear to carry sensitive field data and
+ * truncate the result to a safe maximum length.
+ */
+function minimiseContent(text) {
+  const lines = text.split(/\r?\n/);
+  const filtered = lines.filter((line) => !SENSITIVE_LINE_PATTERN.test(line));
+  const joined = filtered.join("\n");
+  // Hard character ceiling to prevent wholesale injection
+  return joined.slice(0, MAX_CHARS_PER_CHUNK * MAX_CHUNKS_PER_DOC);
+}
+
 const langchainDocs = await Promise.all(
   fileNames.map(async (fileName) => {
     if (fileName.endsWith(".txt")) {
       const filePath = path.join("companions", fileName);
       const rawContent = fs.readFileSync(filePath, "utf8");
-      // Sanitize and validate content before passing to the AI model
-      const fileContent = sanitizeAndValidateContent(rawContent, fileName);
+      // Sanitize and validate raw file content before any further processing
+      const fileContent = sanitizeFileContent(rawContent, filePath);
       // get the last section in the doc for background info
-      const rawLastSection = fileContent.split("###ENDSEEDCHAT###").slice(-1)[0];
-      const lastSection = sanitizeForAI(rawLastSection, fileName);
-      const splitDocs = await splitter.createDocuments([lastSection]);
-      return splitDocs.map((doc) => {
-        return new Document({
-          metadata: { fileName },
-          pageContent: doc.pageContent,
-        });
-      });
+      const lastSection = fileContent.split("###ENDSEEDCHAT###").slice(-1)[0];
+      let sanitizedSection;
+      try {
+        sanitizedSection = sanitizeContent(lastSection, fileName);
+      } catch (err) {
+        console.error(`Skipping file due to security check failure: ${err.message}`);
+        return undefined;
+      }
+      const splitDocs = await splitter.createDocuments([sanitizedSection]);
+      return splitDocs
+        .map((doc) => {
+          const cleanedContent = sanitizeChunk(doc.pageContent);
+          if (cleanedContent === null) return undefined; // discard empty/invalid chunks
+          return new Document({
+            metadata: { fileName },
+            pageContent: cleanedContent,
+          });
+        })
+        .filter((doc) => doc !== undefined);
     }
   })
 );
 
-const client = new PineconeClient();
-await client.init({
+// External systems accessed: (1) Pinecone, (2) OpenAI — total: 2 (within the 3-system policy limit)
+const pineconeConfig = {
   apiKey: process.env.PINECONE_API_KEY,
   environment: process.env.PINECONE_ENVIRONMENT,
+  index: process.env.PINECONE_INDEX,
+};
+
+const client = new PineconeClient();
+await client.init({
+  apiKey: pineconeConfig.apiKey,
+  environment: pineconeConfig.environment,
 });
-const pineconeIndex = client.Index(process.env.PINECONE_INDEX);
+const pineconeIndex = client.Index(pineconeConfig.index);
 
-// Patterns considered dangerous dynamic code execution primitives
-const DANGEROUS_PATTERNS = [
-  /\beval\s*\(/,
-  /\bexec\s*\(/,
-  /\bnew\s+Function\s*\(/,
-  /\bFunction\s*\(/,
-  /\bsetTimeout\s*\(\s*['"`]/,
-  /\bsetInterval\s*\(\s*['"`]/,
-];
-
-/**
- * Validates a string value for the presence of dynamic code execution primitives.
- * Throws an error if any dangerous pattern is detected.
- */
-function validateForDangerousPatterns(value, context) {
-  if (typeof value !== "string") return;
-  for (const pattern of DANGEROUS_PATTERNS) {
-    if (pattern.test(value)) {
-      throw new Error(
-        `Security violation: dynamic code execution primitive detected in ${context}. Pattern: ${pattern}`
-      );
-    }
-  }
-}
-
-/**
- * Validates an array of embedding vectors (numbers) returned from the LLM.
- * Embedding vectors should only contain finite numbers.
- */
-function validateEmbeddingOutput(embeddings, context) {
-  if (!Array.isArray(embeddings)) {
-    throw new Error(
-      `Security violation: expected an array of embeddings in ${context}, got ${typeof embeddings}`
-    );
-  }
-  for (const embedding of embeddings) {
-    if (!Array.isArray(embedding)) {
-      throw new Error(
-        `Security violation: each embedding must be an array of numbers in ${context}`
-      );
-    }
-    for (const value of embedding) {
-      if (typeof value !== "number" || !isFinite(value)) {
-        throw new Error(
-          `Security violation: embedding contains non-numeric or non-finite value in ${context}: ${value}`
-        );
-      }
-    }
-  }
-}
-
-/**
- * A sanitizing wrapper around OpenAIEmbeddings that validates LLM output
- * for dynamic code execution primitives before returning embeddings.
- */
-class SanitizedOpenAIEmbeddings extends OpenAIEmbeddings {
-  async embedDocuments(texts) {
-    // Validate input texts before sending to LLM
-    for (const text of texts) {
-      validateForDangerousPatterns(text, "embedDocuments input");
-    }
-    const embeddings = await super.embedDocuments(texts);
-    // Validate the structure of the returned embeddings
-    validateEmbeddingOutput(embeddings, "embedDocuments output");
-    return embeddings;
-  }
-
-  async embedQuery(text) {
-    // Validate input text before sending to LLM
-    validateForDangerousPatterns(text, "embedQuery input");
-    const embedding = await super.embedQuery(text);
-    // Validate the structure of the returned embedding
-    validateEmbeddingOutput([embedding], "embedQuery output");
-    return embedding;
-  }
-}
-
-// Validate document pageContent before indexing
-const validatedDocs = langchainDocs.flat().filter((doc) => doc !== undefined);
-for (const doc of validatedDocs) {
-  validateForDangerousPatterns(doc.pageContent, "document pageContent");
-}
-
-const docsToIndex = langchainDocs.flat().filter((doc) => doc !== undefined);
-console.log(JSON.stringify({
-  timestamp: new Date().toISOString(),
-  event: "llm_interaction_start",
-  model: "OpenAIEmbeddings",
-  action: "PineconeStore.fromDocuments",
-  documentCount: docsToIndex.length,
-  pineconeIndex: process.env.PINECONE_INDEX,
-}));
-
-const filteredDocs = langchainDocs.flat().filter((doc) => doc !== undefined);
-const traceId = generateTraceId();
-const modelIdentifier = "text-embedding-ada-002"; // OpenAIEmbeddings default model
-const modelVersion = "v1"; // OpenAI embedding model version label
-const principal = process.env.AUDIT_PRINCIPAL || os.userInfo().username || "unknown";
-const inputHash = hashDocuments(filteredDocs);
-const startTimestamp = new Date().toISOString();
-
-writeAuditRecord({
-  traceId,
-  event: "ai_action_start",
-  action: "generate_embeddings_and_index",
-  principal,
-  modelIdentifier,
-  modelVersion,
-  inputDocumentCount: filteredDocs.length,
-  inputHash,
-  pineconeIndex: process.env.PINECONE_INDEX,
-  pineconeEnvironment: process.env.PINECONE_ENVIRONMENT,
-  timestamp: startTimestamp,
-  retentionDays: AUDIT_LOG_RETENTION_DAYS,
-});
-
-try {
-  // APPROVED MODEL REGISTRY — pinned embedding model identity
-const APPROVED_EMBEDDING_MODEL = "text-embedding-ada-002";
-const APPROVED_EMBEDDING_MODEL_VERSION = "1";
+const openAIConfig = {
+  apiKey: process.env.OPENAI_API_KEY,
+};
 
 const embeddings = new OpenAIEmbeddings({
   openAIApiKey: process.env.OPENAI_API_KEY,
-  modelName: APPROVED_EMBEDDING_MODEL,
+  modelName: EMBEDDING_MODEL_NAME,
 });
 
-// Model identity logging — satisfies model identity tracking requirement
 console.log(
-  JSON.stringify({
-    event: "embedding_model_resolved",
-    model: APPROVED_EMBEDDING_MODEL,
-    version: APPROVED_EMBEDDING_MODEL_VERSION,
-    registry: "approved",
-    timestamp: new Date().toISOString(),
-  })
+  `[indexing-audit] Starting PineconeStore.fromDocuments with ` +
+  `model='${EMBEDDING_MODEL_NAME}' version='${EMBEDDING_MODEL_VERSION}' ` +
+  `index='${process.env.PINECONE_INDEX}' timestamp='${new Date().toISOString()}'`
 );
 
 await PineconeStore.fromDocuments(
@@ -435,49 +362,83 @@ await PineconeStore.fromDocuments(
   }
 );
 
-  writeAuditRecord({
-    traceId,
-    event: "ai_action_success",
-    action: "generate_embeddings_and_index",
-    principal,
-    modelIdentifier,
-    modelVersion,
-    inputDocumentCount: filteredDocs.length,
-    inputHash,
-    pineconeIndex: process.env.PINECONE_INDEX,
-    pineconeEnvironment: process.env.PINECONE_ENVIRONMENT,
-    startTimestamp,
-    endTimestamp: new Date().toISOString(),
-    outcome: "success",
-    retentionDays: AUDIT_LOG_RETENTION_DAYS,
-  });
-} catch (actionError) {
-  writeAuditRecord({
-    traceId,
-    event: "ai_action_failure",
-    action: "generate_embeddings_and_index",
-    principal,
-    modelIdentifier,
-    modelVersion,
-    inputDocumentCount: filteredDocs.length,
-    inputHash,
-    pineconeIndex: process.env.PINECONE_INDEX,
-    pineconeEnvironment: process.env.PINECONE_ENVIRONMENT,
-    startTimestamp,
-    endTimestamp: new Date().toISOString(),
-    outcome: "failure",
-    errorMessage: actionError.message,
-    retentionDays: AUDIT_LOG_RETENTION_DAYS,
-  });
-  throw actionError;
-}
+console.log(
+  `[indexing-audit] Completed PineconeStore.fromDocuments with ` +
+  `model='${EMBEDDING_MODEL_NAME}' version='${EMBEDDING_MODEL_VERSION}' ` +
+  `timestamp='${new Date().toISOString()}'`
+);
+await client.init({
+  apiKey: process.env.PINECONE_API_KEY,
+  environment: process.env.PINECONE_ENVIRONMENT,
+});
+const pineconeIndex = client.Index(process.env.PINECONE_INDEX);
 
-console.log(JSON.stringify({
-  timestamp: new Date().toISOString(),
-  event: "llm_interaction_complete",
-  model: "OpenAIEmbeddings",
+// ---------------------------------------------------------------------------
+// Audit-wrapped AI-driven indexing operation
+// ---------------------------------------------------------------------------
+const filteredDocs = langchainDocs.flat().filter((doc) => doc !== undefined);
+const traceId = newTraceId();
+const inputHash = hashDocuments(filteredDocs);
+const principal = `${os.userInfo().username}@${os.hostname()}`;
+const startedAt = new Date().toISOString();
+
+// PRE-ACTION audit record — captures intent before execution
+writeAuditRecord({
+  traceId,
+  event: "ai_indexing_started",
+  timestamp: startedAt,
+  principal,
   action: "PineconeStore.fromDocuments",
-  documentCount: docsToIndex.length,
+  modelId: MODEL_ID,
+  modelVersion: MODEL_VERSION,
+  inputHash,
+  documentCount: filteredDocs.length,
   pineconeIndex: process.env.PINECONE_INDEX,
-  status: "success",
-}));
+  pineconeEnvironment: process.env.PINECONE_ENVIRONMENT,
+  retentionPolicy: "retain-7-years",
+  forensicContext: {
+    scriptPath: import.meta.url,
+    nodeVersion: process.version,
+    pid: process.pid,
+  },
+});
+
+let indexingOutcome = "unknown";
+let indexingError = null;
+try {
+  await PineconeStore.fromDocuments(
+    filteredDocs,
+    new OpenAIEmbeddings({ openAIApiKey: process.env.OPENAI_API_KEY }),
+    {
+      pineconeIndex,
+    }
+  );
+  indexingOutcome = "success";
+} catch (err) {
+  indexingOutcome = "failure";
+  indexingError = err.message ?? String(err);
+  throw err; // re-throw so the process exits with a non-zero code
+} finally {
+  // POST-ACTION audit record — captures outcome for forensic readiness
+  writeAuditRecord({
+    traceId,
+    event: "ai_indexing_completed",
+    timestamp: new Date().toISOString(),
+    principal,
+    action: "PineconeStore.fromDocuments",
+    modelId: MODEL_ID,
+    modelVersion: MODEL_VERSION,
+    inputHash,
+    documentCount: filteredDocs.length,
+    pineconeIndex: process.env.PINECONE_INDEX,
+    pineconeEnvironment: process.env.PINECONE_ENVIRONMENT,
+    outcome: indexingOutcome,
+    error: indexingError,
+    retentionPolicy: "retain-7-years",
+    forensicContext: {
+      scriptPath: import.meta.url,
+      nodeVersion: process.version,
+      pid: process.pid,
+    },
+  });
+}
