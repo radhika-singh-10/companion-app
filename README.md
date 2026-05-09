@@ -9,7 +9,7 @@
 
 This is a tutorial stack to create and host AI companions that you can chat with on a browser or text via SMS. It allows you to determine the personality and backstory of your companion, and uses a vector database with similarity search to retrieve and prompt so the conversations have more depth. It also provides some conversational memory by keeping the conversation in a queue and including it in the prompt. 
 
-It currently contains companions configured to use models from the organization's approved LLM registry. 
+It currently contains companions powered by organization-approved LLMs. 
 
 There are many possible use cases for these companions - romantic (AI girlfriends / boyfriends), friendship, entertainment, coaching, etc. You can guide your companion towards your ideal use case with the backstory you write and the model you choose.
 
@@ -24,6 +24,7 @@ There are many possible use cases for these companions - romantic (AI girlfriend
 - 👩‍💻 [How to contribute to this repo](#how-to-contribute-to-this-repo)
 - 🐍 [Python support](#python-support)
 - 💽 [Exporting your companion to Character.ai](#export-to-characterai)
+- 🔒 [Approved Model Registry](#approved-model-registry)
 
 ## Stack
 
@@ -33,11 +34,23 @@ The stack is based on the [AI Getting Started Stack](https://github.com/a16z-inf
 - App logic: [Next.js](https://nextjs.org/)
 - VectorDB: [Pinecone](https://www.pinecone.io/) / [Supabase pgvector](https://supabase.com/docs/guides/database/extensions/pgvector)
 - LLM orchestration: [Langchain.js](https://js.langchain.com/docs/)
-- Text model: *(configured per organizational approved model registry)*
+- Text model: (approved models — see your organization's LLM registry)
 - Text streaming: [ai sdk](https://github.com/vercel-labs/ai)
 - Conversation history: [Upstash](https://upstash.com/)
 - Deployment: [Fly](https://fly.io/)
 - Text with companion: [Twilio](https://twilio.com/)
+
+## Approved Model Registry
+
+> **Security requirement:** All foundation models used in this project must be sourced exclusively from the organization's internal approved model registry. The following rules apply:
+>
+> 1. **Version pinning**: Every model reference must specify an exact, immutable version identifier (e.g. a SHA digest or a registry-assigned pinned tag). Floating tags such as `latest` are prohibited.
+> 2. **Registry validation**: Before loading any model, the runtime must query the approved model registry to confirm the model identifier and version are listed as approved.
+> 3. **Integrity verification**: Each model artifact must be verified against a cryptographic hash (e.g. SHA-256) published in the approved registry. Models that fail hash verification must not be loaded.
+> 4. **No arbitrary external sources**: Loading models directly from `platform.openai.com`, `replicate.com`, or any other external source without registry mediation is prohibited.
+> 5. **No user-driven model swap**: The `MODEL_NAME` environment variable must be validated against the approved registry at startup. Unrecognized or unapproved values must cause the application to exit with an error.
+>
+> Contact your platform administrator to obtain the current list of approved model identifiers, pinned versions, and their corresponding integrity hashes.
 
 ## Quickstart
 
@@ -317,7 +330,7 @@ npm run export-to-character [COMPANION_NAME] [MODEL_NAME] [USER_ID]
 `
 
 - `COMPANION_NAME`: name of your companion. i.e Alice
-- `MODEL_NAME`: `chatgpt` or `vicuna13b`
+- `MODEL_NAME`: Must be set to an approved, version-pinned model identifier from the **Approved Model Registry**. Arbitrary model names (e.g. `chatgpt` or `vicuna13b`) are not accepted without registry validation and cryptographic integrity verification. Contact your platform administrator for the current list of approved model identifiers and their pinned versions.
 - `USER_ID`: you can find this on Clerk, under "Users" -> click on your user -> copy "User ID"
 
 Once you run this script, you will see two files created under the root directory:
