@@ -10,14 +10,14 @@
     "name": "Evelyn",
     "title": "Adventurous and curious. Working at the space station",
     "imageUrl": "/evelyn.png",
-    "llm": "gpt-3.5-turbo",
+    "llm": "gpt-4",
     "phone": "OPTIONAL_COMPANION_PHONE_NUMBER"
   },
   {
     "name": "Rosie",
     "title": "I'm a house robot who became aware",
     "imageUrl": "/rosie.png",
-    "llm": "gpt-3.5-turbo",
+    "llm": "gpt-4",
     "phone": "OPTIONAL_COMPANION_PHONE_NUMBER"
   },
   {
@@ -31,7 +31,7 @@
     "name": "Lucky",
     "title": "I am a space corgi",
     "imageUrl": "/corgi.png",
-    "llm": "gpt-3.5-turbo",
+    "llm": "gpt-4",
     "phone": "OPTIONAL_COMPANION_PHONE_NUMBER"
   }
 ]
