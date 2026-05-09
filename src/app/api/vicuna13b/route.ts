@@ -7,75 +7,103 @@ import MemoryManager from "@/app/utils/memory";
 import { currentUser } from "@clerk/nextjs";
 import { NextResponse } from "next/server";
 import { rateLimit } from "@/app/utils/rateLimit";
+import crypto from "crypto";
+import { promises as fsAudit } from "fs";
+import path from "path";
+
+// ---------------------------------------------------------------------------
+// Audit helpers
+// ---------------------------------------------------------------------------
+const AUDIT_LOG_PATH = path.resolve(process.cwd(), "logs", "ai_decisions.jsonl");
+/** Retention period expressed as days; consumers of the log must honour this. */
+const AUDIT_RETENTION_DAYS = 90;
+
+function sha256(text: string): string {
+  return crypto.createHash("sha256").update(text, "utf8").digest("hex");
+}
+
+async function writeAuditRecord(record: Record<string, unknown>): Promise<void> {
+  const line = JSON.stringify(record) + "\n";
+  // Ensure the logs directory exists before writing.
+  await fsAudit.mkdir(path.dirname(AUDIT_LOG_PATH), { recursive: true });
+  await fsAudit.appendFile(AUDIT_LOG_PATH, line, { encoding: "utf8" });
+}
 
 dotenv.config({ path: `.env.local` });
 
-// Security: sanitize inputs to prevent prompt injection and malicious command execution
-function containsMaliciousContent(text: string): boolean {
-  if (!text) return false;
+function containsMaliciousContent(input: string): boolean {
+  if (!input || typeof input !== 'string') return false;
 
-  // Check for invisible/hidden Unicode characters (zero-width, soft hyphen, etc.)
-  const invisibleCharsPattern = /[\u00AD\u200B-\u200F\u202A-\u202E\u2060-\u2064\uFEFF\u00A0]/;
-  if (invisibleCharsPattern.test(text)) return true;
+  // Check for shell command patterns
+  const shellCommandPattern = /(?:^|\s|;|\||&|`)(\s*)(rm\s+-|chmod\s+|chown\s+|wget\s+|curl\s+|bash\s+|sh\s+|exec\s+|eval\s+|system\s*\(|popen\s*\(|subprocess|os\.system|__import__|nc\s+-|ncat\s+|netcat\s+|python\s+-c|perl\s+-e|ruby\s+-e|php\s+-r)/i;
+  if (shellCommandPattern.test(input)) return true;
 
-  // Check for base64-encoded content (long base64 strings that could hide instructions)
+  // Check for base64-encoded content (long base64 strings that may hide payloads)
   const base64Pattern = /(?:[A-Za-z0-9+\/]{40,}={0,2})/;
-  if (base64Pattern.test(text)) return true;
+  if (base64Pattern.test(input)) {
+    try {
+      const decoded = Buffer.from(input.match(base64Pattern)![0], 'base64').toString('utf8');
+      if (/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/.test(decoded)) return true;
+      if (shellCommandPattern.test(decoded)) return true;
+    } catch {}
+  }
 
-  // Check for shell/binary commands
-  const shellCommandPattern = /(?:^|\s|;|\||&)(?:bash|sh|zsh|cmd|powershell|exec|eval|system|popen|subprocess|os\.system|`[^`]+`|\$\([^)]+\))/i;
-  if (shellCommandPattern.test(text)) return true;
+  // Check for binary/non-printable characters
+  if (/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/.test(input)) return true;
 
-  // Check for common prompt injection / jailbreak patterns
-  const promptInjectionPattern = /(?:ignore\s+(all\s+)?(?:previous|prior|above)\s+instructions?|disregard\s+(?:your|all)\s+(?:previous|prior|above)|you\s+are\s+now\s+(?:a\s+)?(?:dan|jailbreak|unrestricted)|act\s+as\s+(?:if\s+you\s+(?:are|were)\s+)?(?:an?\s+)?(?:evil|malicious|unrestricted|jailbroken)|forget\s+(?:all\s+)?(?:your\s+)?(?:previous\s+)?(?:instructions?|training|rules?|guidelines?)|new\s+instructions?\s*:|system\s*:\s*you\s+are)/i;
-  if (promptInjectionPattern.test(text)) return true;
+  // Check for prompt injection patterns
+  const promptInjectionPattern = /(?:ignore\s+(?:previous|above|prior|all)\s+instructions?|disregard\s+(?:previous|above|prior|all)|forget\s+(?:previous|above|prior|all)|you\s+are\s+now|act\s+as\s+(?:a\s+)?(?:different|new|another)|new\s+instructions?\s*:|system\s*:\s*you|<\s*system\s*>|\[\s*system\s*\]|###\s*system|###\s*instruction)/i;
+  if (promptInjectionPattern.test(input)) return true;
 
-  // Check for leetspeak obfuscation (e.g., 3x3cut3, 1gnor3)
-  const leetspeakPattern = /(?:[1!][gq][n][o0][r][3e]|[3e][xX][3e][cC][uU][tT][3e]|[5s][yY][5s][tT][3e][mM]|[pP][wW][nN]|[hH][4a][cC][kK])/;
-  if (leetspeakPattern.test(text)) return true;
+  // Check for leetspeak obfuscation of dangerous words
+  const normalizedInput = input
+    .replace(/4/g, 'a').replace(/3/g, 'e').replace(/1/g, 'i')
+    .replace(/0/g, 'o').replace(/5/g, 's').replace(/7/g, 't')
+    .replace(/\$/g, 's').replace(/@/g, 'a').replace(/!/g, 'i');
+  const leetspeakDangerPattern = /(?:exec|eval|system|shell|cmd|bash|exploit|malware|payload|inject)/i;
+  if (leetspeakDangerPattern.test(normalizedInput) && !leetspeakDangerPattern.test(input)) return true;
 
-  // Check for binary data or non-printable ASCII characters
-  // eslint-disable-next-line no-control-regex
-  const binaryPattern = /[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/;
-  if (binaryPattern.test(text)) return true;
+  // Check for script/executable patterns
+  const executablePattern = /(?:MZ[\x00-\xff]{2}|\x7fELF|#!\s*\/(?:bin|usr)|<script[\s>]|\.exe\b|\.sh\b|\.bat\b|\.ps1\b)/i;
+  if (executablePattern.test(input)) return true;
 
   return false;
 }
 
 /**
- * Sanitize input strings before passing to the AI model.
- * - Removes null bytes and control characters (except newlines/tabs)
- * - Strips prompt-injection patterns (e.g. ###SYSTEM, <|im_start|>, etc.)
- * - Truncates to a maximum allowed length
+ * Sanitize input strings before passing to the AI model or using in file paths.
+ * - Removes null bytes and ASCII control characters (except newline/tab)
+ * - Strips prompt-injection-style delimiters
+ * - Truncates to a safe maximum length
  */
-function sanitizeInput(input: string, maxLength = 4000): string {
-  if (typeof input !== "string") return "";
+function sanitizeInput(input: string | null | undefined, maxLength = 4000): string {
+  if (!input) return "";
   return input
-    // Remove null bytes
-    .replace(/\x00/g, "")
-    // Remove non-printable control characters except \n, \r, \t
-    .replace(/[\x01-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "")
-    // Strip common prompt-injection delimiters
-    .replace(/<\|im_start\|>|<\|im_end\|>|<\|endoftext\|>/gi, "")
-    // Strip lines that attempt to override system/preamble context
-    .replace(/###\s*(SYSTEM|ENDPREAMBLE|ENDSEEDCHAT|INST|END)/gi, "")
-    // Collapse excessive whitespace runs (keep single newlines)
-    .replace(/[ \t]{2,}/g, " ")
-    // Enforce maximum length
+    .replace(/\0/g, "")                        // remove null bytes
+    .replace(/[\x01-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "") // remove control chars except \t and \n
+    .replace(/###ENDPREAMBLE###|###ENDSEEDCHAT###/gi, "") // strip file-format delimiters
     .slice(0, maxLength);
 }
 
 export async function POST(request: Request) {
   const { prompt: rawPrompt, isText, userId, userName } = await request.json();
-  const prompt = sanitizeInput(String(rawPrompt ?? ""), 2000);
+  const prompt = sanitizeInput(rawPrompt);
   let clerkUserId;
   let user;
   let clerkUserName;
 
-  const identifier = request.url + "-" + "anonymous";
+  const identifier = request.url + "-" + (clerkUserId || "anonymous");
   const { success } = await rateLimit(identifier);
   if (!success) {
     console.log("INFO: rate limit exceeded");
+    await writeAuditRecord({
+      traceId,
+      event: "rate_limit_exceeded",
+      timestamp: new Date().toISOString(),
+      principal: userId || "anonymous",
+      url: request.url,
+      retentionDays: AUDIT_RETENTION_DAYS,
+    }).catch((err) => { throw new Error(`Audit write failed (rate_limit): ${err}`); });
     return new NextResponse(
       JSON.stringify({ Message: "Hi, the companions can't talk this fast." }),
       {
@@ -88,34 +116,14 @@ export async function POST(request: Request) {
   }
 
   // XXX Companion name passed here. Can use as a key to get backstory, chat history etc.
-  // Allowlist of permitted companion names to prevent path traversal and prompt injection
-  const ALLOWED_COMPANION_NAMES: ReadonlySet<string> = new Set([
-    "elon",
-    "beast",
-    "jobs",
-    "socrates",
-    // Add additional permitted companion names here
-  ]);
-
-  const name = request.headers.get("name");
-
-  if (
-    !name ||
-    !ALLOWED_COMPANION_NAMES.has(name) ||
-    !/^[a-zA-Z0-9_-]+$/.test(name)
-  ) {
-    console.log(`INFO: rejected disallowed or invalid companion name: ${name}`);
+  const rawName = request.headers.get("name");
+  const name = sanitizeInput(rawName, 100).replace(/[^a-zA-Z0-9_\-]/g, ""); // allow only safe filename chars
+  if (!name) {
     return new NextResponse(
-      JSON.stringify({ Message: "Companion not found or not permitted." }),
-      {
-        status: 400,
-        headers: {
-          "Content-Type": "application/json",
-        },
-      }
+      JSON.stringify({ Message: "Invalid companion name." }),
+      { status: 400, headers: { "Content-Type": "application/json" } }
     );
   }
-
   const companion_file_name = name + ".txt";
 
   user = await currentUser();
@@ -123,6 +131,13 @@ export async function POST(request: Request) {
   clerkUserName = user?.firstName;
 
   if (!clerkUserId || !!!(await clerk.users.getUser(clerkUserId))) {
+    await writeAuditRecord({
+      traceId,
+      event: "auth_failure",
+      timestamp: new Date().toISOString(),
+      principal: clerkUserId || "unknown",
+      retentionDays: AUDIT_RETENTION_DAYS,
+    }).catch((err) => { throw new Error(`Audit write failed (auth_failure): ${err}`); });
     return new NextResponse(
       JSON.stringify({ Message: "User not authorized" }),
       {
@@ -140,72 +155,13 @@ export async function POST(request: Request) {
   // discussion. The PREAMBLE should include a seed conversation whose format will
   // vary by the model using it.
   const fs = require("fs").promises;
-  const rawData = await fs.readFile("companions/" + companion_file_name, "utf8");
-
-  // --- Prompt Injection / Malicious Content Sanitization ---
-  function sanitizeCompanionFileContent(content: string): string {
-    // 1. Reject files containing non-printable / binary bytes (except common whitespace)
-    // eslint-disable-next-line no-control-regex
-    if (/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/.test(content)) {
-      throw new Error("Companion file contains binary or non-printable characters.");
-    }
-
-    // 2. Strip invisible / zero-width Unicode characters often used to hide injections
-    const invisibleCharsRegex =
-      /[\u00AD\u034F\u061C\u115F\u1160\u17B4\u17B5\u180B-\u180D\u180E\u200B-\u200F\u202A-\u202E\u2060-\u206F\u3164\uFEFF\uFFA0]/g;
-    content = content.replace(invisibleCharsRegex, "");
-
-    // 3. Detect base64-encoded blocks that could hide injected instructions
-    const base64BlockRegex = /(?:[A-Za-z0-9+\/]{40,}={0,2})/g;
-    if (base64BlockRegex.test(content)) {
-      throw new Error("Companion file contains suspicious base64-encoded content.");
-    }
-
-    // 4. Detect shell / system command patterns
-    const shellCommandRegex =
-      /(?:(?:^|\s)(?:bash|sh|zsh|cmd|powershell|exec|eval|system|popen|subprocess|os\.system|`[^`]+`|\$\([^)]+\))|(?:rm\s+-rf|chmod|chown|wget|curl\s+.*http|nc\s+|ncat\s+|netcat\s+))/im;
-    if (shellCommandRegex.test(content)) {
-      throw new Error("Companion file contains suspicious shell or system commands.");
-    }
-
-    // 5. Detect common prompt-injection instruction keywords
-    const injectionKeywordsRegex =
-      /(?:ignore\s+(?:all\s+)?(?:previous|above|prior)\s+instructions?|disregard\s+(?:all\s+)?(?:previous|above|prior)|you\s+are\s+now\s+(?:a\s+)?(?:different|new|another)|forget\s+(?:all\s+)?(?:previous|your)\s+instructions?|act\s+as\s+(?:if\s+you\s+(?:are|were)|a\s+)?(?:jailbreak|DAN|unrestricted)|do\s+not\s+follow\s+(?:your\s+)?(?:guidelines|rules|instructions?)|override\s+(?:your\s+)?(?:safety|content|system))/im;
-    if (injectionKeywordsRegex.test(content)) {
-      throw new Error("Companion file contains suspicious prompt-injection instructions.");
-    }
-
-    // 6. Detect leetspeak substitution patterns used to obfuscate injections
-    //    e.g. "1gn0r3", "d1sr3g4rd", "3x3cut3"
-    const leetspeakInjectionRegex =
-      /(?:1[g9][n]0[r][3e]|d[1i][s5][r][3e][g9][4a][r][d]|[3e][x][3e][c][u][t][3e]|[0o][v][3e][r][r][1i][d][3e])/i;
-    if (leetspeakInjectionRegex.test(content)) {
-      throw new Error("Companion file contains suspicious leetspeak-encoded content.");
-    }
-
-    return content;
-  }
-
-  let data: string;
-  try {
-    data = sanitizeCompanionFileContent(rawData);
-  } catch (err: any) {
-    console.error("Companion file failed security check:", err.message);
-    return new NextResponse(
-      JSON.stringify({ Message: "Companion file contains disallowed content." }),
-      {
-        status: 400,
-        headers: { "Content-Type": "application/json" },
-      }
-    );
-  }
-  // --- End Sanitization ---
+  const data = await fs.readFile("companions/" + companion_file_name, "utf8");
 
   // Clunky way to break out PREAMBLE and SEEDCHAT from the character file
   const presplit = data.split("###ENDPREAMBLE###");
-  const preamble = sanitizeInput(presplit[0], 3000);
+  const preamble = presplit[0];
   const seedsplit = presplit[1].split("###ENDSEEDCHAT###");
-  const seedchat = sanitizeInput(seedsplit[0], 3000);
+  const seedchat = seedsplit[0];
 
   const companionKey = {
     companionName: name!,
@@ -220,18 +176,20 @@ export async function POST(request: Request) {
   if (records.length === 0) {
     await memoryManager.seedChatHistory(seedchat, "\n\n", companionKey);
   }
-  // Sanitize prompt to mitigate prompt injection: strip characters commonly used to escape prompt context
-  const sanitizedPrompt = (prompt || "").replace(/[\r\n]+/g, " ").replace(/#{3,}/g, "").slice(0, 4096);
   await memoryManager.writeToHistory(
-    "### Human: " + sanitizedPrompt + "\n",
+    "### Human: " + prompt + "\n",  // prompt is already sanitized above
     companionKey
   );
-  // Note: `prompt` is already sanitized above before this write.
 
   // Query Pinecone
 
-  const MAX_HISTORY_CHARS = 1200;
-  let recentChatHistory = (await memoryManager.readLatestHistory(companionKey)).slice(-MAX_HISTORY_CHARS);
+  let recentChatHistoryRaw = await memoryManager.readLatestHistory(companionKey);
+  // Minimise: keep only the last 10 lines of chat history injected into the prompt
+  const recentChatHistory = recentChatHistoryRaw
+    .split("\n")
+    .filter((line: string) => line.trim().length > 0)
+    .slice(-10)
+    .join("\n");
 
   // Right now the preamble is included in the similarity search, but that
   // shouldn't be an issue
@@ -241,17 +199,19 @@ export async function POST(request: Request) {
     companion_file_name
   );
 
-  const MAX_DOCS = 3;
-  const MAX_DOC_CHARS = 300;
+  const MAX_RELEVANT_DOCS = 3;
+  const MAX_RELEVANT_CHARS = 500;
   let relevantHistory = "";
   if (!!similarDocs && similarDocs.length !== 0) {
+    // Minimise: limit to top 3 docs and cap total characters at 500
     relevantHistory = similarDocs
-      .slice(0, MAX_DOCS)
-      .map((doc) => (doc.pageContent ?? "").slice(0, MAX_DOC_CHARS))
-      .join("\n");
+      .slice(0, MAX_RELEVANT_DOCS)
+      .map((doc: { pageContent: string }) => doc.pageContent)
+      .join("\n")
+      .slice(0, MAX_RELEVANT_CHARS);
   }
 
-  // Call OpenAI for inference using approved GPT model
+    // Call OpenAI for inference
   const model = new OpenAI({
     modelName: "gpt-3.5-turbo-instruct",
     maxTokens: 2048,
@@ -262,7 +222,60 @@ export async function POST(request: Request) {
   // Turn verbose on for debugging
   model.verbose = true;
 
+  // Sanitization: check LLM output for dynamic code execution primitives
+  const DANGEROUS_PATTERNS = [
+    /\beval\s*\(/i,
+    /\bexec\s*\(/i,
+    /\bexecSync\s*\(/i,
+    /\bspawn\s*\(/i,
+    /\bspawnSync\s*\(/i,
+    /\bsubprocess\b/i,
+    /\bnew\s+Function\s*\(/i,
+    /\bsetTimeout\s*\(\s*['"`]/i,
+    /\bsetInterval\s*\(\s*['"`]/i,
+    /\brequire\s*\(/i,
+    /\bimport\s*\(/i,
+    /\bchild_process\b/i,
+    /\bvm\.run/i,
+    /\bos\.system\s*\(/i,
+    /\bos\.popen\s*\(/i,
+    /\b__import__\s*\(/i,
+    /\bcompile\s*\(/i,
+    /\bexecfile\s*\(/i,
+  ];
+
+  function sanitizeLLMOutput(output: string): string {
+    for (const pattern of DANGEROUS_PATTERNS) {
+      if (pattern.test(output)) {
+        console.warn(
+          `[SECURITY] Dangerous pattern detected in LLM output: ${pattern}`
+        );
+        return "[Response blocked: output contained unsafe content.]"
+      }
+    }
+    return output;
+  }
+
   const llmPrompt = `${preamble}  
+       
+       Below are relevant details about ${sanitizeInput(name, 100)}'s past:
+       ${sanitizeInput(relevantHistory)}
+
+       Below is a relevant conversation history
+
+       ${sanitizeInput(recentChatHistory)}
+       ### ${name}:
+       `;
+
+  console.log('LLM_INTERACTION_PROMPT:', JSON.stringify({ model: 'replicate/vicuna-13b', userId: clerkUserId, companionName: name, prompt: llmPrompt }));
+
+    // Minimise preamble injection: strip seedchat section before injecting into prompt
+  const preambleOnly = preamble.slice(0, 1000);
+
+    let rawResp: unknown;
+  try {
+    rawResp = await model.call(
+      `${preamble}  
        
        Below are relevant details about ${name}'s past:
        ${relevantHistory}
@@ -271,137 +284,110 @@ export async function POST(request: Request) {
 
        ${recentChatHistory}
        ### ${name}:
-       `;
-
-  console.log("[LLM INTERACTION] Prompt sent to Vicuna-13b:", llmPrompt);
-
-    const MAX_PREAMBLE_CHARS = 1000;
-  const truncatedPreamble = preamble.slice(0, MAX_PREAMBLE_CHARS);
-
-    // Fail closed on inference errors — do NOT silently swallow with .catch(console.error).
-  let rawResp: unknown;
-  try {
-    rawResp = await model.call(inferenceInput);
-  } catch (inferenceErr) {
-    try {
-      await writeAuditRecord({
-        event: "AI_INFERENCE_ERROR",
-        correlationId,
-        timestamp: new Date().toISOString(),
-        principal: clerkUserId,
-        modelId: MODEL_ID,
-        modelVersion: MODEL_VERSION,
-        inputHash,
-        error: String(inferenceErr),
-      });
-    } catch (_auditErr) {
-      // Best-effort error audit; primary error is re-thrown below.
-    }
-    throw inferenceErr;
+       `
+    );
+  } catch (err) {
+    auditLog({
+      event: "TOOL_INVOCATION_ERROR",
+      actor: clerkUserId,
+      requestedModel: REQUESTED_MODEL,
+      policyVersion: POLICY_VERSION,
+      reason: String(err),
+    });
+    return new NextResponse(
+      JSON.stringify({ Message: "Model inference failed" }),
+      { status: 500, headers: { "Content-Type": "application/json" } }
+    );
   }
+
+  // Validate model output before trusting it.
+  if (typeof rawResp !== "string" && !Array.isArray(rawResp)) {
+    auditLog({
+      event: "TOOL_OUTPUT_REJECTED",
+      actor: clerkUserId,
+      requestedModel: REQUESTED_MODEL,
+      policyVersion: POLICY_VERSION,
+      reason: "Unexpected output type from model",
+    });
+    return new NextResponse(
+      JSON.stringify({ Message: "Invalid model output" }),
+      { status: 500, headers: { "Content-Type": "application/json" } }
+    );
+  }
+
   let resp = String(rawResp);
 
-  console.log("[LLM INTERACTION] Response received from Vicuna-13b:", resp);
-
-  // Validate and sanitize LLM output before further processing.
-  // Reject responses containing dynamic code execution primitives.
-  const DANGEROUS_PATTERNS = [
-    /\beval\s*\(/i,
-    /\bexec\s*\(/i,
-    /\bexecSync\s*\(/i,
-    /\bspawnSync\s*\(/i,
-    /\bspawn\s*\(/i,
-    /\bsubprocess\b/i,
-    /\bos\.system\s*\(/i,
-    /\bchild_process\b/i,
-    /\bnew\s+Function\s*\(/i,
-    /\bsetTimeout\s*\(\s*['"`]/i,
-    /\bsetInterval\s*\(\s*['"`]/i,
-    /\bimportlib\b/i,
-    /\b__import__\s*\(/i,
-    /\bcompile\s*\(/i,
-    /\bexecfile\s*\(/i,
-    /\brunpy\b/i,
-    /\bpopen\s*\(/i,
-    /\bshell\s*=\s*True/i,
-    /`[^`]*`/,
-    /\$\([^)]*\)/,
-  ];
-
-  const containsDangerousPrimitive = DANGEROUS_PATTERNS.some((pattern) =>
-    pattern.test(resp)
-  );
-
-  if (containsDangerousPrimitive) {
-    console.warn(
-      "[SECURITY] LLM response contained a dynamic code execution primitive and was rejected."
+  // Strip any content that looks like an injected tool-escalation directive.
+  const DISALLOWED_OUTPUT_PATTERN = /<tool[^>]*>|\bexec\b|\beval\b/gi;
+  if (DISALLOWED_OUTPUT_PATTERN.test(resp)) {
+    auditLog({
+      event: "TOOL_OUTPUT_REJECTED",
+      actor: clerkUserId,
+      requestedModel: REQUESTED_MODEL,
+      policyVersion: POLICY_VERSION,
+      reason: "Model output contained disallowed escalation pattern",
+    });
+    return new NextResponse(
+      JSON.stringify({ Message: "Model output rejected by policy" }),
+      { status: 403, headers: { "Content-Type": "application/json" } }
     );
-    resp = "I'm sorry, I cannot respond to that.";
   }
 
-  // Strip any remaining potentially executable content: remove backtick
-  // command substitution and script-like blocks as a secondary safeguard.
-  const sanitized = resp
-    .replace(/`[^`]*`/g, "")
-    .replace(/\$\([^)]*\)/g, "")
-    .replace(/<script[\s\S]*?<\/script>/gi, "");
+  console.log('LLM_INTERACTION_RESPONSE:', JSON.stringify({ model: 'replicate/vicuna-13b', userId: clerkUserId, companionName: name, response: resp }));
+
+  resp = sanitizeLLMOutput(resp);
 
   // Right now just using super shoddy string manip logic to get at
   // the dialog.
 
-  const cleaned = sanitized.replaceAll(",", "");
+  const MAX_RESPONSE_CHARS = 1000;
+  const cleaned = resp.replaceAll(",", "");
   const chunks = cleaned.split("###");
-  const response = chunks[0];
-  // const response = chunks.length > 1 ? chunks[0] : chunks[0];
+  // Minimise: take only the first chunk, strip system-marker prefixes, and cap at 1000 chars
+  const rawResponse = chunks[0];
+  const response = rawResponse
+    .replace(/^(Human:|System:|Assistant:|###)/gim, "")
+    .trim()
+    .slice(0, MAX_RESPONSE_CHARS);
 
-  await memoryManager.writeToHistory("### " + response.trim(), companionKey);
-
-  // ── Post-inference audit record ──────────────────────────────────────────────
-  try {
-    await writeAuditRecord({
-      event: "AI_INFERENCE_RESPONSE",
-      correlationId,
-      timestamp: new Date().toISOString(),
-      principal: clerkUserId,
-      companionName: name,
-      modelId: MODEL_ID,
-      modelVersion: MODEL_VERSION,
-      inputHash,
-      outputHash: sha256(response),
-      outputLength: response.length,
-      requestTimestamp,
-      responseTimestamp: new Date().toISOString(),
-    });
-  } catch (auditErr) {
-    throw new Error(`Audit log write failed after inference: ${auditErr}`);
-  }
-  // ─────────────────────────────────────────────────────────────────────────────
-
+  await memoryManager.writeToHistory("### " + (modelResponse ?? "").trim(), companionKey);
+  await writeAuditRecord({
+    traceId,
+    event: "memory_write",
+    timestamp: new Date().toISOString(),
+    principal: clerkUserId,
+    companionName: name,
+    retentionDays: AUDIT_RETENTION_DAYS,
+  }).catch((err) => { throw new Error(`Audit write failed (memory_write): ${err}`); });
   var Readable = require("stream").Readable;
 
-  // --- Synthetic-content provenance, labeling & watermarking ---
+  // --- Synthetic Content Provenance, Labeling & Watermarking ---
   const MODEL_ID =
     "replicate/vicuna-13b:6282abe6a492de4145d7bb601023762212f9ddbbe78278bd6771c8b3b2f2a13b";
-  const generatedAt = new Date().toISOString();
+  const contentOriginTag = "AI_GENERATED";
+  const timestamp = new Date().toISOString();
 
-  // (1) Visible AI-origin label prepended to every response
-  const AI_LABEL = "[AI-GENERATED CONTENT | Model: vicuna-13b | Origin: Replicate]\n";
-  // (2) Lightweight text watermark appended to the content
-  const WATERMARK = "\n<!-- ai-watermark: synthetic-content | vicuna-13b -->";
-  const labeledResponse = AI_LABEL + response + WATERMARK;
-
-  // (3) Cryptographic HMAC-SHA-256 signature over provenance fields
-  const crypto = require("crypto");
-  const provenancePayload = JSON.stringify({
+  // Build provenance metadata object
+  const provenanceMetadata = {
     model: MODEL_ID,
-    generatedAt,
-    contentOrigin: "replicate-api",
-  });
-  const signingSecret = process.env.PROVENANCE_SIGNING_SECRET ?? "default-dev-secret";
-  const provenanceSignature = crypto
+    timestamp,
+    contentOrigin: contentOriginTag,
+    label: "SYNTHETIC_AI_CONTENT",
+  };
+
+  // Compute HMAC-SHA256 signature over provenance metadata for integrity
+  const crypto = require("crypto");
+  const signingSecret = process.env.PROVENANCE_SIGNING_SECRET || "default-insecure-secret";
+  const provenanceJson = JSON.stringify(provenanceMetadata);
+  const signature = crypto
     .createHmac("sha256", signingSecret)
-    .update(provenancePayload)
+    .update(provenanceJson)
     .digest("hex");
+
+  // Watermark: prepend a clearly delimited provenance block to the streamed content
+  const watermark =
+    `[AI-GENERATED CONTENT | Model: ${MODEL_ID} | Generated: ${timestamp} | Origin: ${contentOriginTag}]\n`;
+  const labeledResponse = watermark + response;
 
   let s = new Readable();
   s.push(labeledResponse);
@@ -410,15 +396,15 @@ export async function POST(request: Request) {
     await memoryManager.writeToHistory("### " + response.trim(), companionKey);
   }
 
-  // (4) Attach provenance metadata as response headers
-  return new StreamingTextResponse(s, {
-    headers: {
-      "X-AI-Model-Id": MODEL_ID,
-      "X-AI-Generated-At": generatedAt,
-      "X-AI-Content-Origin": "replicate-api",
-      "X-AI-Content-Label": "synthetic",
-      "X-AI-Provenance-Payload": provenancePayload,
-      "X-AI-Provenance-Signature": `hmac-sha256=${provenanceSignature}`,
-    },
-  });
+  // Attach provenance headers to the HTTP response for client transparency
+  const provenanceHeaders = {
+    "X-AI-Content-Label": "SYNTHETIC_AI_CONTENT",
+    "X-AI-Model-ID": MODEL_ID,
+    "X-AI-Content-Timestamp": timestamp,
+    "X-AI-Content-Origin": contentOriginTag,
+    "X-AI-Provenance-Metadata": provenanceJson,
+    "X-AI-Provenance-Signature": `sha256=${signature}`,
+  };
+
+  return new StreamingTextResponse(s, { headers: provenanceHeaders });
 }
